@@ -30,7 +30,7 @@ MAX_FILE_SIZE   = 50 * 1024 * 1024   # 50 MB Telegram bot limit
 MAX_QUEUE_SIZE  = 15
 WORKERS         = 3
 RATE_LIMIT_SEC  = 8                   # seconds between requests per user
-FFMPEG_LOCATION = None                # e.g. r"C:\ffmpeg"  →  None = auto-detect
+FFMPEG_LOCATION = None                # e.g. r"C:\ffmpeg"  —  None = auto-detect
 
 DOWNLOAD_FOLDER.mkdir(exist_ok=True)
 CACHE_FOLDER.mkdir(exist_ok=True)
@@ -108,17 +108,18 @@ def fmt_uptime(sec: int) -> str:
 
 def rich_progress_bar(pct: float, width: int = 14) -> str:
     filled    = int(pct / 100 * width)
+    empty     = width - filled
     fill_char = "▓" if pct < 33 else ("█" if pct < 66 else "▉")
-    return fill_char * filled + "░" * (width - filled)
+    return fill_char * filled + "░" * empty
 
 def mini_wave(frame: int, width: int = 8) -> str:
     return "".join(WAVE[(i + frame) % len(WAVE)] for i in range(width))
 
 def sanitize_title(title: str) -> str:
-    """Strip characters that are illegal in Windows/Linux filenames."""
-    title = re.sub(r'[\\/*?:"<>|]', "_", title)
+    """Strip characters illegal in Windows/Linux filenames, cap length."""
+    title = re.sub(r'[\\/*?:"<>|#%&{}$!\'@+`=]', "_", title)
     title = re.sub(r'\s+', " ", title).strip()
-    return title[:100]
+    return title[:120]
 
 def cache_key(url: str, typ: str, quality: str) -> str:
     h = hashlib.md5(f"{url}|{typ}|{quality}".encode()).hexdigest()[:12]
@@ -151,6 +152,7 @@ def build_caption(info: dict) -> str:
     date      = info.get("upload_date", "")
     date_str  = f"{date[:4]}-{date[4:6]}-{date[6:]}" if len(date) == 8 else "—"
     extractor = info.get("extractor_key", "").upper()
+
     return (
         f"🎬 *{title}*\n\n"
         f"👤 {uploader}   📅 {date_str}\n"
@@ -165,14 +167,16 @@ def build_buttons(info: dict, url: str) -> list:
         f.get("height") for f in formats
         if f.get("height") and f.get("height") in (360, 480, 720, 1080)
     ))
-    icons = {360: "📱", 480: "💻", 720: "🖥", 1080: "📺"}
-    rows, vid_row = [], []
 
+    rows  = []
+    icons = {360: "📱", 480: "💻", 720: "🖥", 1080: "📺"}
+
+    vid_row = []
     for h in heights:
         vid_row.append(
             InlineKeyboardButton(
                 f"{icons.get(h, '📹')} {h}p",
-                callback_data=f"mp4|{h}|{url}",
+                callback_data=f"mp4|{h}|{url}"
             )
         )
         if len(vid_row) == 2:
@@ -222,7 +226,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• YouTube  • TikTok  • Instagram\n"
         "• Facebook  • Twitter/X  • Reddit\n"
         "• SoundCloud  • Twitch  • Vimeo\n\n"
-        "Just paste a link and choose your format\\!\n\n"
+        "Just paste a link and choose your format!\n\n"
         "📋 _Commands:_\n"
         "`/queue` — queue status\n"
         "`/stats` — bot statistics\n"
@@ -236,7 +240,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1️⃣ Paste any supported video URL\n"
         "2️⃣ Wait for the format picker\n"
         "3️⃣ Choose MP4 resolution or MP3 quality\n"
-        "4️⃣ The file arrives named after the video title\n\n"
+        "4️⃣ The file is sent with the video/song title as filename\n\n"
         "⚠️ *Limits*\n"
         f"• Max file size: `{fmt_size(MAX_FILE_SIZE)}`\n"
         f"• Queue slots: `{MAX_QUEUE_SIZE}`\n"
@@ -383,7 +387,7 @@ async def worker(worker_id: int):
     while True:
         try:
             query, typ, quality, url, msg = await download_queue.get()
-            active_downloads[worker_id] = url
+            active_downloads[worker_id]   = url
             await process(query, typ, quality, url, msg, worker_id)
         except Exception as e:
             logger.exception("Worker %d crashed: %s", worker_id, e)
@@ -392,7 +396,7 @@ async def worker(worker_id: int):
             download_queue.task_done()
 
 # ╔══════════════════════════════════════════╗
-#   PROCESS  (main download + upload logic)
+#   PROCESS / DOWNLOAD
 # ╚══════════════════════════════════════════╝
 
 async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
@@ -424,21 +428,15 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
             cache_path.unlink(missing_ok=True)
         return
 
-    # ── Fetch info to get the real title ─────────────────────────
+    # ── Fetch title for filename ──────────────────────────────────
     try:
-        info = await loop.run_in_executor(None, get_video_info, url)
-    except Exception as e:
-        logger.error("Info re-fetch failed: %s", e)
-        info = {}
+        info        = await loop.run_in_executor(None, get_video_info, url)
+        raw_title   = info.get("title") or "download"
+        clean_title = sanitize_title(raw_title)
+    except Exception:
+        clean_title = "download"
 
-    raw_title = info.get("title") or "download"
-    safe_name = sanitize_title(raw_title)   # e.g. "Blinding Lights - The Weeknd"
-
-    # ── yt-dlp options ────────────────────────────────────────────
-    # Use the sanitized title as the filename base.
-    # restrictfilenames=True makes yt-dlp additionally strip spaces/special chars.
-    output_template = str(DOWNLOAD_FOLDER / f"{safe_name}.%(ext)s")
-
+    # ── yt-dlp format string ──────────────────────────────────────
     if typ == "mp3":
         fmt = "bestaudio/best"
     elif quality == "best":
@@ -446,6 +444,10 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     else:
         fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
 
+    # Named after the video/song title
+    output_template = str(DOWNLOAD_FOLDER / f"{clean_title}.%(ext)s")
+
+    # ── Progress hook (runs on yt-dlp thread) ────────────────────
     frame_counter = {"n": 0, "last_pct": -1.0}
 
     def hook(d):
@@ -465,8 +467,10 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
         wave     = mini_wave(frame_counter["n"], width=6)
         speed    = (d.get("_speed_str") or "—").strip()
         eta      = (d.get("_eta_str")   or "—").strip()
-        size_str = (d.get("_total_bytes_str") or
-                    d.get("_total_bytes_estimate_str") or "—").strip()
+        size_str = (
+            d.get("_total_bytes_str") or
+            d.get("_total_bytes_estimate_str") or "—"
+        ).strip()
         phase    = "🎵 Audio" if typ == "mp3" else "🎥 Video"
 
         text = (
@@ -475,6 +479,7 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
             f"{wave}\n\n"
             f"📦 `{size_str}`   ⚡ `{speed}`   ⏱ `{eta}`"
         )
+
         loop.call_soon_threadsafe(
             asyncio.ensure_future,
             safe_edit(msg, text, parse_mode=ParseMode.MARKDOWN),
@@ -483,7 +488,6 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     ydl_opts = {
         "format":              fmt,
         "outtmpl":             output_template,
-        "restrictfilenames":   True,          # yt-dlp strips remaining illegal chars
         "progress_hooks":      [hook],
         "quiet":               True,
         "no_warnings":         True,
@@ -502,7 +506,7 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
 
     try:
         file_path = await loop.run_in_executor(
-            None, lambda: _run_ydl(ydl_opts, url, typ, safe_name)
+            None, lambda: _run_ydl(ydl_opts, url, typ, clean_title)
         )
     except Exception as e:
         logger.error("Download error: %s", e)
@@ -524,12 +528,12 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
         )
         return
 
-    file_path = Path(file_path)
-    file_size = file_path.stat().st_size
+    fp        = Path(file_path)
+    file_size = fp.stat().st_size
 
     # ── Size check ────────────────────────────────────────────────
     if file_size > MAX_FILE_SIZE:
-        file_path.unlink(missing_ok=True)
+        fp.unlink(missing_ok=True)
         stats["failed"] += 1
         await safe_edit(
             msg,
@@ -544,23 +548,18 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     # ── Upload ────────────────────────────────────────────────────
     await safe_edit(
         msg,
-        f"📤 *Uploading* `{fmt_size(file_size)}`…\n"
-        f"🎵 _{raw_title[:50]}_",
+        f"📤 *Uploading* `{fp.name}` — `{fmt_size(file_size)}`…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
-        with open(file_path, "rb") as f:
-            caption = (
-                f"✅ *{raw_title[:50]}*\n"
-                f"{'🎵 Audio' if typ == 'mp3' else '🎥 Video'} • "
-                f"`{fmt_size(file_size)}`"
-            )
+        with open(fp, "rb") as f:
+            caption = f"✅ *{fp.stem}*"
             if typ == "mp3":
                 await msg.reply_audio(
                     audio=f,
                     caption=caption,
-                    title=raw_title[:60],
+                    title=fp.stem,
                     parse_mode=ParseMode.MARKDOWN,
                     read_timeout=180,
                     write_timeout=180,
@@ -574,13 +573,11 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
                     read_timeout=180,
                     write_timeout=180,
                 )
-
         await msg.delete()
         stats["downloads"] += 1
 
-        # ── Save to cache ─────────────────────────────────────────
-        cache_path.write_bytes(file_path.read_bytes())
-        logger.info("Cached: %s", cache_path.name)
+        # Cache for next time
+        cache_path.write_bytes(fp.read_bytes())
 
     except Exception as e:
         logger.error("Upload error: %s", e)
@@ -591,52 +588,42 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
             parse_mode=ParseMode.MARKDOWN,
         )
     finally:
-        file_path.unlink(missing_ok=True)
+        fp.unlink(missing_ok=True)
 
 # ╔══════════════════════════════════════════╗
 #   BLOCKING YT-DLP CALL
 # ╚══════════════════════════════════════════╝
 
-def _run_ydl(opts: dict, url: str, typ: str, safe_name: str):
+def _run_ydl(opts: dict, url: str, typ: str, clean_title: str):
     """
-    Runs yt-dlp synchronously.
-    Returns the final file path (with the real title as filename).
+    Runs yt-dlp synchronously. Returns the final file path as a string.
+    For MP3: postprocessor replaces the original extension with .mp3,
+    so we resolve the final path by checking the .mp3 sibling.
     """
     with yt_dlp.YoutubeDL(opts) as ydl:
         info     = ydl.extract_info(url, download=True)
-        raw_path = ydl.prepare_filename(info)
+        raw_path = ydl.prepare_filename(info)  # e.g. downloads/Song Title.webm
 
     if typ == "mp3":
-        # After FFmpegExtractAudio the extension becomes .mp3
-        mp3 = Path(raw_path).with_suffix(".mp3")
-        if mp3.exists():
-            return str(mp3)
+        # After FFmpegExtractAudio the ext becomes .mp3
+        mp3_path = Path(raw_path).with_suffix(".mp3")
+        if mp3_path.exists():
+            return str(mp3_path)
 
-        # Fallback: yt-dlp may have sanitized the name differently
-        # Search the downloads folder for any .mp3 containing safe_name
-        clean = re.sub(r"[^a-zA-Z0-9]", "_", safe_name[:30]).lower()
+        # Fallback: scan downloads folder for matching stem
         for f in DOWNLOAD_FOLDER.iterdir():
-            if f.suffix == ".mp3" and clean[:10] in f.stem.lower():
+            if f.stem == clean_title and f.suffix == ".mp3":
                 return str(f)
 
-        # Last resort: newest .mp3 in the folder
-        mp3_files = sorted(DOWNLOAD_FOLDER.glob("*.mp3"), key=lambda x: x.stat().st_mtime)
-        if mp3_files:
-            return str(mp3_files[-1])
+        # Last resort: any .mp3 whose stem contains the title
+        for f in DOWNLOAD_FOLDER.iterdir():
+            if f.suffix == ".mp3" and clean_title[:20].lower() in f.stem.lower():
+                return str(f)
 
         return None
 
-    # For MP4 / video — just return the path yt-dlp prepared
-    if Path(raw_path).exists():
-        return raw_path
-
-    # Fallback: newest file matching the name
-    stem = Path(raw_path).stem
-    for f in DOWNLOAD_FOLDER.iterdir():
-        if f.stem == stem:
-            return str(f)
-
-    return None
+    # MP4 — raw_path is the final merged file
+    return raw_path if Path(raw_path).exists() else None
 
 # ╔══════════════════════════════════════════╗
 #   UNKNOWN MESSAGE
