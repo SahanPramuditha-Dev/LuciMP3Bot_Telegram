@@ -5,7 +5,6 @@ import logging
 import time
 import hashlib
 from pathlib import Path
-from datetime import timedelta
 
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,11 +26,11 @@ from telegram.error import BadRequest
 BOT_TOKEN       = "8263619482:AAF08HfJpNMnYMRZO-wkWkEq_jHVQJNvPO4"
 DOWNLOAD_FOLDER = Path("downloads")
 CACHE_FOLDER    = Path("cache")
-MAX_FILE_SIZE   = 50 * 1024 * 1024   # 50 MB
+MAX_FILE_SIZE   = 50 * 1024 * 1024   # 50 MB Telegram bot limit
 MAX_QUEUE_SIZE  = 15
 WORKERS         = 3
 RATE_LIMIT_SEC  = 8                   # seconds between requests per user
-FFMPEG_LOCATION = None                # e.g. r"C:\ffmpeg" — None = auto-detect
+FFMPEG_LOCATION = None                # e.g. r"C:\ffmpeg"  →  None = auto-detect
 
 DOWNLOAD_FOLDER.mkdir(exist_ok=True)
 CACHE_FOLDER.mkdir(exist_ok=True)
@@ -92,8 +91,8 @@ def fmt_duration(sec: int) -> str:
     return (f"{h}h " if h else "") + (f"{m}m " if m else "") + f"{s}s"
 
 def fmt_views(n: int) -> str:
-    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
-    if n >= 1_000:     return f"{n/1_000:.1f}K"
+    if n >= 1_000_000: return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:     return f"{n / 1_000:.1f}K"
     return str(n)
 
 def fmt_uptime(sec: int) -> str:
@@ -108,15 +107,18 @@ def fmt_uptime(sec: int) -> str:
     return " ".join(parts)
 
 def rich_progress_bar(pct: float, width: int = 14) -> str:
-    """Segmented gradient bar that changes character density by progress."""
-    filled = int(pct / 100 * width)
-    empty  = width - filled
+    filled    = int(pct / 100 * width)
     fill_char = "▓" if pct < 33 else ("█" if pct < 66 else "▉")
-    return fill_char * filled + "░" * empty
+    return fill_char * filled + "░" * (width - filled)
 
 def mini_wave(frame: int, width: int = 8) -> str:
-    """Animated wave — changes every update tick."""
     return "".join(WAVE[(i + frame) % len(WAVE)] for i in range(width))
+
+def sanitize_title(title: str) -> str:
+    """Strip characters that are illegal in Windows/Linux filenames."""
+    title = re.sub(r'[\\/*?:"<>|]', "_", title)
+    title = re.sub(r'\s+', " ", title).strip()
+    return title[:100]
 
 def cache_key(url: str, typ: str, quality: str) -> str:
     h = hashlib.md5(f"{url}|{typ}|{quality}".encode()).hexdigest()[:12]
@@ -141,15 +143,14 @@ def get_video_info(url: str) -> dict:
         return ydl.extract_info(url, download=False)
 
 def build_caption(info: dict) -> str:
-    title    = info.get("title", "Unknown")[:60]
-    uploader = info.get("uploader") or info.get("channel") or "—"
-    duration = fmt_duration(info.get("duration") or 0)
-    views    = fmt_views(info.get("view_count") or 0)
-    likes    = fmt_views(info.get("like_count") or 0)
-    date     = info.get("upload_date", "")
-    date_str = f"{date[:4]}-{date[4:6]}-{date[6:]}" if len(date) == 8 else "—"
+    title     = info.get("title", "Unknown")[:60]
+    uploader  = info.get("uploader") or info.get("channel") or "—"
+    duration  = fmt_duration(info.get("duration") or 0)
+    views     = fmt_views(info.get("view_count") or 0)
+    likes     = fmt_views(info.get("like_count") or 0)
+    date      = info.get("upload_date", "")
+    date_str  = f"{date[:4]}-{date[4:6]}-{date[6:]}" if len(date) == 8 else "—"
     extractor = info.get("extractor_key", "").upper()
-
     return (
         f"🎬 *{title}*\n\n"
         f"👤 {uploader}   📅 {date_str}\n"
@@ -164,16 +165,14 @@ def build_buttons(info: dict, url: str) -> list:
         f.get("height") for f in formats
         if f.get("height") and f.get("height") in (360, 480, 720, 1080)
     ))
-
-    rows = []
     icons = {360: "📱", 480: "💻", 720: "🖥", 1080: "📺"}
+    rows, vid_row = [], []
 
-    vid_row = []
     for h in heights:
         vid_row.append(
             InlineKeyboardButton(
                 f"{icons.get(h, '📹')} {h}p",
-                callback_data=f"mp4|{h}|{url}"
+                callback_data=f"mp4|{h}|{url}",
             )
         )
         if len(vid_row) == 2:
@@ -237,7 +236,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1️⃣ Paste any supported video URL\n"
         "2️⃣ Wait for the format picker\n"
         "3️⃣ Choose MP4 resolution or MP3 quality\n"
-        "4️⃣ The file will be sent directly here\n\n"
+        "4️⃣ The file arrives named after the video title\n\n"
         "⚠️ *Limits*\n"
         f"• Max file size: `{fmt_size(MAX_FILE_SIZE)}`\n"
         f"• Queue slots: `{MAX_QUEUE_SIZE}`\n"
@@ -367,7 +366,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    label = f"🎵 MP3 {quality}kbps" if typ == "mp3" else f"🎥 MP4 {quality}p"
+    label      = f"🎵 MP3 {quality}kbps" if typ == "mp3" else f"🎥 MP4 {quality}p"
     status_msg = await query.message.reply_text(
         f"🕐 *Queued* — {label}\n_Waiting for a free worker…_",
         parse_mode=ParseMode.MARKDOWN,
@@ -392,6 +391,10 @@ async def worker(worker_id: int):
             active_downloads.pop(worker_id, None)
             download_queue.task_done()
 
+# ╔══════════════════════════════════════════╗
+#   PROCESS  (main download + upload logic)
+# ╚══════════════════════════════════════════╝
+
 async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     loop = asyncio.get_event_loop()
 
@@ -405,11 +408,15 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
             with open(cache_path, "rb") as f:
                 caption = f"✅ {'🎵 Audio' if typ == 'mp3' else '🎥 Video'} _(cached)_"
                 if typ == "mp3":
-                    await msg.reply_audio(f, caption=caption, parse_mode=ParseMode.MARKDOWN,
-                                          read_timeout=120, write_timeout=120)
+                    await msg.reply_audio(
+                        f, caption=caption, parse_mode=ParseMode.MARKDOWN,
+                        read_timeout=120, write_timeout=120,
+                    )
                 else:
-                    await msg.reply_video(f, caption=caption, parse_mode=ParseMode.MARKDOWN,
-                                          supports_streaming=True, read_timeout=120, write_timeout=120)
+                    await msg.reply_video(
+                        f, caption=caption, parse_mode=ParseMode.MARKDOWN,
+                        supports_streaming=True, read_timeout=120, write_timeout=120,
+                    )
             await msg.delete()
             stats["downloads"] += 1
         except Exception as e:
@@ -417,7 +424,21 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
             cache_path.unlink(missing_ok=True)
         return
 
-    # ── yt-dlp format ─────────────────────────────────────────────
+    # ── Fetch info to get the real title ─────────────────────────
+    try:
+        info = await loop.run_in_executor(None, get_video_info, url)
+    except Exception as e:
+        logger.error("Info re-fetch failed: %s", e)
+        info = {}
+
+    raw_title = info.get("title") or "download"
+    safe_name = sanitize_title(raw_title)   # e.g. "Blinding Lights - The Weeknd"
+
+    # ── yt-dlp options ────────────────────────────────────────────
+    # Use the sanitized title as the filename base.
+    # restrictfilenames=True makes yt-dlp additionally strip spaces/special chars.
+    output_template = str(DOWNLOAD_FOLDER / f"{safe_name}.%(ext)s")
+
     if typ == "mp3":
         fmt = "bestaudio/best"
     elif quality == "best":
@@ -425,8 +446,7 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     else:
         fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
 
-    output_template  = str(DOWNLOAD_FOLDER / "%(id)s.%(ext)s")
-    frame_counter    = {"n": 0, "last_pct": -1.0}
+    frame_counter = {"n": 0, "last_pct": -1.0}
 
     def hook(d):
         if d["status"] != "downloading":
@@ -455,7 +475,6 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
             f"{wave}\n\n"
             f"📦 `{size_str}`   ⚡ `{speed}`   ⏱ `{eta}`"
         )
-
         loop.call_soon_threadsafe(
             asyncio.ensure_future,
             safe_edit(msg, text, parse_mode=ParseMode.MARKDOWN),
@@ -464,6 +483,7 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     ydl_opts = {
         "format":              fmt,
         "outtmpl":             output_template,
+        "restrictfilenames":   True,          # yt-dlp strips remaining illegal chars
         "progress_hooks":      [hook],
         "quiet":               True,
         "no_warnings":         True,
@@ -481,7 +501,9 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     await safe_edit(msg, "⬇️ _Starting download…_", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        raw_path = await loop.run_in_executor(None, lambda: _run_ydl(ydl_opts, url, typ))
+        file_path = await loop.run_in_executor(
+            None, lambda: _run_ydl(ydl_opts, url, typ, safe_name)
+        )
     except Exception as e:
         logger.error("Download error: %s", e)
         stats["failed"] += 1
@@ -492,7 +514,7 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
         )
         return
 
-    if not raw_path or not Path(raw_path).exists():
+    if not file_path or not Path(file_path).exists():
         stats["failed"] += 1
         await safe_edit(
             msg,
@@ -502,9 +524,10 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
         )
         return
 
-    file_path = Path(raw_path)
+    file_path = Path(file_path)
     file_size = file_path.stat().st_size
 
+    # ── Size check ────────────────────────────────────────────────
     if file_size > MAX_FILE_SIZE:
         file_path.unlink(missing_ok=True)
         stats["failed"] += 1
@@ -518,29 +541,46 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
         )
         return
 
+    # ── Upload ────────────────────────────────────────────────────
     await safe_edit(
         msg,
-        f"📤 *Uploading* `{fmt_size(file_size)}`…",
+        f"📤 *Uploading* `{fmt_size(file_size)}`…\n"
+        f"🎵 _{raw_title[:50]}_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
         with open(file_path, "rb") as f:
-            caption = f"✅ Here's your {'🎵 audio' if typ == 'mp3' else '🎥 video'}!"
+            caption = (
+                f"✅ *{raw_title[:50]}*\n"
+                f"{'🎵 Audio' if typ == 'mp3' else '🎥 Video'} • "
+                f"`{fmt_size(file_size)}`"
+            )
             if typ == "mp3":
                 await msg.reply_audio(
-                    audio=f, caption=caption,
-                    read_timeout=180, write_timeout=180,
+                    audio=f,
+                    caption=caption,
+                    title=raw_title[:60],
+                    parse_mode=ParseMode.MARKDOWN,
+                    read_timeout=180,
+                    write_timeout=180,
                 )
             else:
                 await msg.reply_video(
-                    video=f, caption=caption,
+                    video=f,
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN,
                     supports_streaming=True,
-                    read_timeout=180, write_timeout=180,
+                    read_timeout=180,
+                    write_timeout=180,
                 )
+
         await msg.delete()
         stats["downloads"] += 1
+
+        # ── Save to cache ─────────────────────────────────────────
         cache_path.write_bytes(file_path.read_bytes())
+        logger.info("Cached: %s", cache_path.name)
 
     except Exception as e:
         logger.error("Upload error: %s", e)
@@ -557,25 +597,49 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
 #   BLOCKING YT-DLP CALL
 # ╚══════════════════════════════════════════╝
 
-def _run_ydl(opts: dict, url: str, typ: str):
+def _run_ydl(opts: dict, url: str, typ: str, safe_name: str):
+    """
+    Runs yt-dlp synchronously.
+    Returns the final file path (with the real title as filename).
+    """
     with yt_dlp.YoutubeDL(opts) as ydl:
         info     = ydl.extract_info(url, download=True)
         raw_path = ydl.prepare_filename(info)
 
     if typ == "mp3":
+        # After FFmpegExtractAudio the extension becomes .mp3
         mp3 = Path(raw_path).with_suffix(".mp3")
         if mp3.exists():
             return str(mp3)
-        stem = Path(raw_path).stem
+
+        # Fallback: yt-dlp may have sanitized the name differently
+        # Search the downloads folder for any .mp3 containing safe_name
+        clean = re.sub(r"[^a-zA-Z0-9]", "_", safe_name[:30]).lower()
         for f in DOWNLOAD_FOLDER.iterdir():
-            if f.stem == stem and f.suffix == ".mp3":
+            if f.suffix == ".mp3" and clean[:10] in f.stem.lower():
                 return str(f)
+
+        # Last resort: newest .mp3 in the folder
+        mp3_files = sorted(DOWNLOAD_FOLDER.glob("*.mp3"), key=lambda x: x.stat().st_mtime)
+        if mp3_files:
+            return str(mp3_files[-1])
+
         return None
 
-    return raw_path if Path(raw_path).exists() else None
+    # For MP4 / video — just return the path yt-dlp prepared
+    if Path(raw_path).exists():
+        return raw_path
+
+    # Fallback: newest file matching the name
+    stem = Path(raw_path).stem
+    for f in DOWNLOAD_FOLDER.iterdir():
+        if f.stem == stem:
+            return str(f)
+
+    return None
 
 # ╔══════════════════════════════════════════╗
-#   UNKNOWN
+#   UNKNOWN MESSAGE
 # ╚══════════════════════════════════════════╝
 
 async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
