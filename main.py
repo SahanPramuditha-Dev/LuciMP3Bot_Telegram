@@ -211,38 +211,41 @@ def oauth2_token_exists() -> bool:
             or OAUTH2_TOKEN_FILE.exists())
 
 def _http_post(url: str, data: dict) -> dict:
-    """Minimal synchronous HTTPS POST, returns parsed JSON."""
-    body = urllib.parse.urlencode(data).encode()
-    req  = urllib.request.Request(
-        url, data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"}
-    )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode())
+    """Synchronous HTTPS POST using httpx (already a dependency)."""
+    import httpx
+    r = httpx.post(url, data=data, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 def _run_oauth2_flow(notify_callback) -> None:
     """
     Background thread — complete Google device auth flow.
-    Calls notify_callback(url, code) once URL is ready.
-    Calls notify_callback(None, None) when finished (success or fail).
+    notify_callback(url, code, error=None) — url+code ready, or error string
+    notify_callback(None, None) — finished (check oauth2_token_exists())
     """
     try:
-        # Step 1: request device code
+        # Step 1: request device code from Google
         resp = _http_post(_DEVICE_CODE_URL, {
             "client_id": _OAUTH_CLIENT_ID,
             "scope":     _OAUTH_SCOPE,
         })
+
+        # Surface any error Google returns (e.g. invalid client)
+        if "error" in resp:
+            notify_callback(None, None, error=f"Google error: {resp['error']} — {resp.get('error_description','')}")
+            return
+
         device_code      = resp["device_code"]
         user_code        = resp["user_code"]
         verification_url = resp.get("verification_url", "https://www.google.com/device")
         interval         = int(resp.get("interval", 5))
         expires_in       = int(resp.get("expires_in", 300))
-        logger.info("OAuth2 device_code ready, user_code=%s", user_code)
+        logger.info("OAuth2 device_code ready, user_code=%s url=%s", user_code, verification_url)
 
-        # Step 2: notify admin
+        # Step 2: send URL+code to admin
         notify_callback(verification_url, user_code)
 
-        # Step 3: poll until approved or timed out
+        # Step 3: poll until approved or expired
         deadline = time.time() + expires_in
         while time.time() < deadline:
             time.sleep(interval)
@@ -255,7 +258,7 @@ def _run_oauth2_flow(notify_callback) -> None:
                 })
                 if "access_token" in token:
                     _write_ydlp_token(token)
-                    notify_callback(None, None)  # success
+                    notify_callback(None, None)
                     return
                 err = token.get("error", "")
                 if err == "authorization_pending":
@@ -264,16 +267,18 @@ def _run_oauth2_flow(notify_callback) -> None:
                     interval = min(interval + 5, 30)
                     continue
                 if err in ("access_denied", "expired_token"):
-                    logger.warning("OAuth2 flow: %s", err)
-                    break
+                    notify_callback(None, None, error=f"Google: {err}")
+                    return
             except Exception as pe:
-                logger.debug("OAuth2 poll error: %s", pe)
+                logger.debug("OAuth2 poll: %s", pe)
                 time.sleep(interval)
 
     except Exception as e:
-        logger.error("OAuth2 flow error: %s", e)
+        logger.error("OAuth2 flow crash: %s", e)
+        notify_callback(None, None, error=str(e))
+        return
 
-    notify_callback(None, None)  # failure
+    notify_callback(None, None)  # timeout
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -882,7 +887,7 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
     _oauth_pending[uid] = {"ts": time.time()}
 
-    def on_event(url: str | None, code: str | None):
+    def on_event(url: str | None, code: str | None, error: str | None = None):
         """Called from background thread. url=None means flow is done."""
 
         if url is not None:
@@ -912,6 +917,24 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # url is None → flow finished
         _oauth_pending.pop(uid, None)
+
+        if error:
+            # Show the real error so we know what went wrong
+            err_safe = error[:200].replace("`", "'")
+            fail_text = (
+                f"```\n"
+                f"[AUTH ERROR]\n"
+                f"{err_safe}\n"
+                f"\n"
+                f"Run /auth again to retry.\n"
+                f"```"
+            )
+            asyncio.run_coroutine_threadsafe(
+                safe_edit(status_msg, fail_text, parse_mode=ParseMode.MARKDOWN_V2),
+                loop,
+            )
+            return
+
         if oauth2_token_exists():
             success_text = (
                 "```\n"
@@ -931,12 +954,8 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             fail_text = (
                 "```\n"
-                "[AUTH FAILED / TIMED OUT]\n"
-                "Possible reasons:\n"
-                "  - Code not entered in time\n"
-                "  - Google request blocked\n"
-                "  - Network error\n"
-                "\n"
+                "[AUTH TIMED OUT]\n"
+                "Code not entered in time.\n"
                 "Run /auth again to retry.\n"
                 "```"
             )
@@ -964,6 +983,46 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     threading.Thread(target=run_with_error_guard, daemon=True, name="oauth2").start()
 
+
+async def cmd_authtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /authtest — test the Google OAuth2 endpoint directly and show raw response.
+    Use this to diagnose /auth failures.
+    """
+    uid = update.effective_user.id
+    if ADMIN_IDS and uid not in ADMIN_IDS:
+        return
+
+    msg = await update.message.reply_text(
+        "```\n[TESTING GOOGLE API...]\n```", parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+    def _test():
+        import httpx, traceback
+        results = []
+        try:
+            results.append(f"client_id: {_OAUTH_CLIENT_ID[:30]}...")
+            results.append(f"endpoint : {_DEVICE_CODE_URL}")
+            r = httpx.post(_DEVICE_CODE_URL, data={
+                "client_id": _OAUTH_CLIENT_ID,
+                "scope":     _OAUTH_SCOPE,
+            }, timeout=15)
+            results.append(f"HTTP     : {r.status_code}")
+            body = r.text[:400].replace("`", "'")
+            results.append(f"response :\n{body}")
+        except Exception as e:
+            results.append(f"ERROR: {e}")
+            results.append(traceback.format_exc()[-300:].replace("`","'"))
+        return "\n".join(results)
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, _test)
+    safe_result = result.replace("\\", "/")
+    await safe_edit(
+        msg,
+        f"```\n[GOOGLE API TEST]\n{safe_result}\n```",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t0  = time.monotonic()
@@ -1964,6 +2023,7 @@ def main():
 
     app.add_handler(CommandHandler("start",      cmd_start))
     app.add_handler(CommandHandler("auth",       cmd_auth))
+    app.add_handler(CommandHandler("authtest",   cmd_authtest))
     app.add_handler(CommandHandler("help",       cmd_help))
     app.add_handler(CommandHandler("stats",      cmd_stats))
     app.add_handler(CommandHandler("queue",      cmd_queue))
