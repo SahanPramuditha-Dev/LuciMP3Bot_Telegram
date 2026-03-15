@@ -1,9 +1,11 @@
 import os
 import re
+import json
 import asyncio
 import logging
 import time
 import hashlib
+import subprocess
 from pathlib import Path
 
 import yt_dlp
@@ -20,12 +22,11 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 # ╔══════════════════════════════════════════╗
-#   CONFIG  —  set via environment variables
-#   on Railway: Dashboard → Variables → Add
+#   CONFIG  —  set via Railway Variables
 # ╚══════════════════════════════════════════╝
 
 BOT_TOKEN    = os.environ.get("BOT_TOKEN",    "YOUR_TOKEN")
-WEBHOOK_URL  = os.environ.get("WEBHOOK_URL",  "")   # e.g. https://your-app.up.railway.app
+WEBHOOK_URL  = os.environ.get("WEBHOOK_URL",  "")
 PORT         = int(os.environ.get("PORT",     8443))
 
 DOWNLOAD_FOLDER = Path("downloads")
@@ -41,8 +42,66 @@ DOWNLOAD_FOLDER.mkdir(exist_ok=True)
 CACHE_FOLDER.mkdir(exist_ok=True)
 
 # ╔══════════════════════════════════════════╗
-#   SHARED YT-DLP OPTIONS  (403 fix)
+#   LOGGING
 # ╚══════════════════════════════════════════╝
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log")],
+)
+logger = logging.getLogger(__name__)
+
+# ╔══════════════════════════════════════════╗
+#   PO TOKEN  (YouTube bot-detection bypass)
+# ╚══════════════════════════════════════════╝
+
+def get_po_token() -> tuple[str | None, str | None]:
+    """
+    Generate a YouTube PO token using the npm package
+    youtube-po-token-generator (installed in Dockerfile).
+    Returns (po_token, visitor_data) or (None, None) on failure.
+    """
+    try:
+        result = subprocess.run(
+            ["youtube-po-token-generator"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning("PO token generator exited with code %d: %s",
+                           result.returncode, result.stderr.strip())
+            return None, None
+        data = json.loads(result.stdout)
+        po   = data.get("poToken")
+        vis  = data.get("visitorData")
+        if po:
+            logger.info("PO token generated successfully.")
+        return po, vis
+    except FileNotFoundError:
+        logger.warning("youtube-po-token-generator not found — skipping PO token.")
+        return None, None
+    except Exception as e:
+        logger.warning("PO token generation failed: %s", e)
+        return None, None
+
+# Generate once at startup
+PO_TOKEN, VISITOR_DATA = get_po_token()
+
+# ╔══════════════════════════════════════════╗
+#   SHARED YT-DLP OPTIONS
+# ╚══════════════════════════════════════════╝
+
+def build_extractor_args() -> dict:
+    """Build extractor_args based on available PO token."""
+    args = {"player_client": ["web", "android"]}
+    if PO_TOKEN:
+        args["player_client"] = ["web"]
+        args["po_token"]      = [f"web+{PO_TOKEN}"]
+    if VISITOR_DATA:
+        args["visitor_data"]  = [VISITOR_DATA]
+    return {"youtube": args}
 
 YDL_COMMON: dict = {
     "quiet":       True,
@@ -56,31 +115,17 @@ YDL_COMMON: dict = {
         "Accept-Language": "en-US,en;q=0.9",
         "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     },
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["web", "android"],
-        }
-    },
+    "extractor_args": build_extractor_args(),
     "socket_timeout": 30,
     "retries":        5,
 }
 
 if COOKIES_FILE.exists():
     YDL_COMMON["cookiefile"] = str(COOKIES_FILE)
+    logger.info("Loaded cookies from %s", COOKIES_FILE)
 
 if FFMPEG_LOCATION:
     YDL_COMMON["ffmpeg_location"] = FFMPEG_LOCATION
-
-# ╔══════════════════════════════════════════╗
-#   LOGGING
-# ╚══════════════════════════════════════════╝
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log")],
-)
-logger = logging.getLogger(__name__)
 
 # ╔══════════════════════════════════════════╗
 #   GLOBALS
@@ -142,32 +187,14 @@ def fmt_uptime(sec: int) -> str:
     parts.append(f"{s}s")
     return " ".join(parts)
 
-def rich_progress_bar(pct: float, width: int = 20) -> str:
-    filled = int(pct / 100 * width)
-    empty = width - filled
-    
-    # Gradient: green -> yellow -> red
-    green_len = int(0.5 * width)  # 50% green
-    yellow_len = int(0.3 * width) # 30% yellow
-    
-    if filled <= green_len:
-        fill = "🟩" * filled
-    elif filled <= green_len + yellow_len:
-        fill = "🟩" * green_len + "🟨" * (filled - green_len)
-    else:
-        fill = "🟩" * green_len + "🟨" * yellow_len + "🟥" * (filled - green_len - yellow_len)
-    
-    shine = "✦" if pct >= 90 else ""
-    return f"[{fill}{'⬜' * empty}{shine}]"
+def rich_progress_bar(pct: float, width: int = 14) -> str:
+    filled    = int(pct / 100 * width)
+    empty     = width - filled
+    fill_char = "▓" if pct < 33 else ("█" if pct < 66 else "▉")
+    return fill_char * filled + "░" * empty
 
 def mini_wave(frame: int, width: int = 8) -> str:
     return "".join(WAVE[(i + frame) % len(WAVE)] for i in range(width))
-
-def phase_emoji(pct: float) -> str:
-    if pct < 10: return "🔄"
-    elif pct < 50: return "⬇️"
-    elif pct < 90: return "⚙️"
-    else: return "📤"
 
 def sanitize_title(title: str) -> str:
     title = re.sub(r'[\\/*?:"<>|#%&{}$!\'@+`=]', "_", title)
@@ -184,6 +211,18 @@ async def safe_edit(msg, text: str, **kwargs):
     except BadRequest as e:
         if "not modified" not in str(e).lower():
             logger.debug("Edit skipped: %s", e)
+
+def error_hint(e: Exception) -> str:
+    msg = str(e)
+    if "Sign in" in msg or "bot" in msg.lower():
+        if PO_TOKEN:
+            return "\n\n💡 _PO token is active but YouTube still blocked — try adding `cookies.txt`_"
+        return "\n\n💡 _YouTube bot detection triggered — PO token not available on this server_"
+    if "403" in msg:
+        return "\n\n💡 _HTTP 403 — server IP may be blocked by YouTube_"
+    if "Private" in msg or "private" in msg:
+        return "\n\n💡 _This video is private or age-restricted_"
+    return ""
 
 # ╔══════════════════════════════════════════╗
 #   VIDEO INFO
@@ -277,8 +316,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode         = "Webhook" if WEBHOOK_URL else "Polling"
+    mode          = "Webhook" if WEBHOOK_URL else "Polling"
     cookie_status = "✅ Loaded" if COOKIES_FILE.exists() else "❌ Not found"
+    po_status     = "✅ Active" if PO_TOKEN else "❌ Not available"
     text = (
         "ℹ️ *How to use*\n\n"
         "1️⃣ Paste any supported video URL\n"
@@ -294,7 +334,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Use `360p` for fastest video download\n"
         "• Cached files are sent instantly ⚡\n\n"
         f"🔌 *Mode*       : `{mode}`\n"
-        f"🍪 *Cookie file*: {cookie_status}"
+        f"🔑 *PO Token*   : {po_status}\n"
+        f"🍪 *Cookies*    : {cookie_status}"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -365,12 +406,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("Info fetch error: %s", e)
         stop_anim.set()
         anim_task.cancel()
-        err_hint = ""
-        if "403" in str(e):
-            err_hint = "\n\n💡 _Place `cookies.txt` next to the bot — see /help_"
+        hint = error_hint(e)
         await safe_edit(
             msg,
-            f"❌ *Could not fetch video info*\n\n`{str(e)[:200]}`{err_hint}",
+            f"❌ *Could not fetch video info*\n\n`{str(e)[:200]}`{hint}",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -510,7 +549,7 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
         frame_counter["n"]       += 1
 
         bar      = rich_progress_bar(pct)
-        wave     = mini_wave(frame_counter["n"], 20)
+        wave     = mini_wave(frame_counter["n"], width=6)
         speed    = (d.get("_speed_str") or "—").strip()
         eta      = (d.get("_eta_str")   or "—").strip()
         size_str = (
@@ -553,10 +592,10 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     except Exception as e:
         logger.error("Download error: %s", e)
         stats["failed"] += 1
-        err_hint = "\n\n💡 _Place `cookies.txt` next to the bot to fix 403 errors_" if "403" in str(e) else ""
+        hint = error_hint(e)
         await safe_edit(
             msg,
-            f"❌ *Download failed*\n\n`{str(e)[:300]}`{err_hint}",
+            f"❌ *Download failed*\n\n`{str(e)[:300]}`{hint}",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -666,9 +705,11 @@ async def post_init(app):
     for i in range(WORKERS):
         asyncio.create_task(worker(i + 1))
     logger.info(
-        "%d workers started. Mode: %s",
+        "%d workers started. Mode: %s | PO token: %s | Cookies: %s",
         WORKERS,
         f"webhook ({WEBHOOK_URL})" if WEBHOOK_URL else "polling",
+        "yes" if PO_TOKEN else "no",
+        "yes" if COOKIES_FILE.exists() else "no",
     )
 
 def main():
@@ -696,7 +737,6 @@ def main():
     app.add_handler(MessageHandler(filters.ALL, handle_unknown))
 
     if WEBHOOK_URL:
-        # ── Webhook mode  (Railway / any cloud with public URL) ──
         logger.info("Starting in WEBHOOK mode on port %d", PORT)
         app.run_webhook(
             listen="0.0.0.0",
@@ -705,7 +745,6 @@ def main():
             drop_pending_updates=True,
         )
     else:
-        # ── Polling mode  (local development) ───────────────────
         logger.info("Starting in POLLING mode")
         app.run_polling(drop_pending_updates=True)
 
