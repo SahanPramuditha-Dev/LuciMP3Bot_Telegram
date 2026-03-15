@@ -20,18 +20,22 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 # ╔══════════════════════════════════════════╗
-#   CONFIG
+#   CONFIG  —  set via environment variables
+#   on Railway: Dashboard → Variables → Add
 # ╚══════════════════════════════════════════╝
 
-BOT_TOKEN       = "8263619482:AAF08HfJpNMnYMRZO-wkWkEq_jHVQJNvPO4"
+BOT_TOKEN    = os.environ.get("BOT_TOKEN",    "YOUR_TOKEN")
+WEBHOOK_URL  = os.environ.get("WEBHOOK_URL",  "")   # e.g. https://your-app.up.railway.app
+PORT         = int(os.environ.get("PORT",     8443))
+
 DOWNLOAD_FOLDER = Path("downloads")
 CACHE_FOLDER    = Path("cache")
-COOKIES_FILE    = Path("cookies.txt")   # optional — export from browser
-MAX_FILE_SIZE   = 50 * 1024 * 1024      # 50 MB Telegram bot limit
+COOKIES_FILE    = Path("cookies.txt")
+MAX_FILE_SIZE   = 50 * 1024 * 1024
 MAX_QUEUE_SIZE  = 15
 WORKERS         = 3
 RATE_LIMIT_SEC  = 8
-FFMPEG_LOCATION = None                  # e.g. r"C:\ffmpeg"  —  None = auto-detect
+FFMPEG_LOCATION = os.environ.get("FFMPEG_LOCATION", None)
 
 DOWNLOAD_FOLDER.mkdir(exist_ok=True)
 CACHE_FOLDER.mkdir(exist_ok=True)
@@ -61,9 +65,11 @@ YDL_COMMON: dict = {
     "retries":        5,
 }
 
-# Attach cookies file if it exists next to the script
 if COOKIES_FILE.exists():
     YDL_COMMON["cookiefile"] = str(COOKIES_FILE)
+
+if FFMPEG_LOCATION:
+    YDL_COMMON["ffmpeg_location"] = FFMPEG_LOCATION
 
 # ╔══════════════════════════════════════════╗
 #   LOGGING
@@ -167,8 +173,6 @@ async def safe_edit(msg, text: str, **kwargs):
 
 def get_video_info(url: str) -> dict:
     opts = {**YDL_COMMON, "skip_download": True}
-    if FFMPEG_LOCATION:
-        opts["ffmpeg_location"] = FFMPEG_LOCATION
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -255,6 +259,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode         = "Webhook" if WEBHOOK_URL else "Polling"
     cookie_status = "✅ Loaded" if COOKIES_FILE.exists() else "❌ Not found"
     text = (
         "ℹ️ *How to use*\n\n"
@@ -268,10 +273,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Rate limit    : `{RATE_LIMIT_SEC}s` between requests\n\n"
         "💡 *Tips*\n"
         "• Use `MP3 320` for best audio quality\n"
-        "• Use `360p` for fastest download\n"
+        "• Use `360p` for fastest video download\n"
         "• Cached files are sent instantly ⚡\n\n"
-        f"🍪 *Cookie file* : {cookie_status}\n"
-        "_Place `cookies.txt` next to the script to bypass age/geo restrictions._"
+        f"🔌 *Mode*       : `{mode}`\n"
+        f"🍪 *Cookie file*: {cookie_status}"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -344,9 +349,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         anim_task.cancel()
         err_hint = ""
         if "403" in str(e):
-            err_hint = "\n\n💡 _Try placing `cookies.txt` next to the bot — see /help_"
-        elif "Private" in str(e) or "private" in str(e):
-            err_hint = "\n\n💡 _This video is private or age-restricted_"
+            err_hint = "\n\n💡 _Place `cookies.txt` next to the bot — see /help_"
         await safe_edit(
             msg,
             f"❌ *Could not fetch video info*\n\n`{str(e)[:200]}`{err_hint}",
@@ -454,7 +457,7 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
             cache_path.unlink(missing_ok=True)
         return
 
-    # ── Fetch title for filename ──────────────────────────────────
+    # ── Fetch title ───────────────────────────────────────────────
     try:
         info        = await loop.run_in_executor(None, get_video_info, url)
         raw_title   = info.get("title") or "download"
@@ -462,7 +465,7 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     except Exception:
         clean_title = "download"
 
-    # ── yt-dlp format string ──────────────────────────────────────
+    # ── yt-dlp format ─────────────────────────────────────────────
     if typ == "mp3":
         fmt = "bestaudio/best"
     elif quality == "best":
@@ -472,7 +475,7 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
 
     output_template = str(DOWNLOAD_FOLDER / f"{clean_title}.%(ext)s")
 
-    # ── Progress hook (runs on yt-dlp thread) ────────────────────
+    # ── Progress hook ─────────────────────────────────────────────
     frame_counter = {"n": 0, "last_pct": -1.0}
 
     def hook(d):
@@ -509,7 +512,6 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
             safe_edit(msg, text, parse_mode=ParseMode.MARKDOWN),
         )
 
-    # ── Build yt-dlp opts (with 403 fix merged in) ───────────────
     ydl_opts = {
         **YDL_COMMON,
         "format":              fmt,
@@ -517,8 +519,6 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
         "progress_hooks":      [hook],
         "merge_output_format": "mp4" if typ == "mp4" else None,
     }
-    if FFMPEG_LOCATION:
-        ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
     if typ == "mp3":
         ydl_opts["postprocessors"] = [{
             "key":              "FFmpegExtractAudio",
@@ -535,9 +535,7 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     except Exception as e:
         logger.error("Download error: %s", e)
         stats["failed"] += 1
-        err_hint = ""
-        if "403" in str(e):
-            err_hint = "\n\n💡 _Place `cookies.txt` next to the bot to fix 403 errors — see /help_"
+        err_hint = "\n\n💡 _Place `cookies.txt` next to the bot to fix 403 errors_" if "403" in str(e) else ""
         await safe_edit(
             msg,
             f"❌ *Download failed*\n\n`{str(e)[:300]}`{err_hint}",
@@ -558,7 +556,6 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     fp        = Path(file_path)
     file_size = fp.stat().st_size
 
-    # ── Size check ────────────────────────────────────────────────
     if file_size > MAX_FILE_SIZE:
         fp.unlink(missing_ok=True)
         stats["failed"] += 1
@@ -572,7 +569,6 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
         )
         return
 
-    # ── Upload ────────────────────────────────────────────────────
     await safe_edit(
         msg,
         f"📤 *Uploading* `{fp.name}` — `{fmt_size(file_size)}`…",
@@ -584,26 +580,19 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
             caption = f"✅ *{fp.stem}*"
             if typ == "mp3":
                 await msg.reply_audio(
-                    audio=f,
-                    caption=caption,
-                    title=fp.stem,
+                    audio=f, caption=caption, title=fp.stem,
                     parse_mode=ParseMode.MARKDOWN,
-                    read_timeout=180,
-                    write_timeout=180,
+                    read_timeout=180, write_timeout=180,
                 )
             else:
                 await msg.reply_video(
-                    video=f,
-                    caption=caption,
+                    video=f, caption=caption,
                     parse_mode=ParseMode.MARKDOWN,
                     supports_streaming=True,
-                    read_timeout=180,
-                    write_timeout=180,
+                    read_timeout=180, write_timeout=180,
                 )
         await msg.delete()
         stats["downloads"] += 1
-
-        # Cache for next time
         cache_path.write_bytes(fp.read_bytes())
 
     except Exception as e:
@@ -627,15 +616,12 @@ def _run_ydl(opts: dict, url: str, typ: str, clean_title: str):
         raw_path = ydl.prepare_filename(info)
 
     if typ == "mp3":
-        # FFmpegExtractAudio replaces the extension with .mp3
         mp3_path = Path(raw_path).with_suffix(".mp3")
         if mp3_path.exists():
             return str(mp3_path)
-        # Fallback: scan folder for exact stem match
         for f in DOWNLOAD_FOLDER.iterdir():
             if f.stem == clean_title and f.suffix == ".mp3":
                 return str(f)
-        # Last resort: partial stem match
         for f in DOWNLOAD_FOLDER.iterdir():
             if f.suffix == ".mp3" and clean_title[:20].lower() in f.stem.lower():
                 return str(f)
@@ -661,17 +647,24 @@ async def post_init(app):
     download_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
     for i in range(WORKERS):
         asyncio.create_task(worker(i + 1))
-    cookie_msg = f"with cookies ({COOKIES_FILE})" if COOKIES_FILE.exists() else "without cookies"
-    logger.info("%d download workers started %s.", WORKERS, cookie_msg)
+    logger.info(
+        "%d workers started. Mode: %s",
+        WORKERS,
+        f"webhook ({WEBHOOK_URL})" if WEBHOOK_URL else "polling",
+    )
 
 def main():
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+        .connect_timeout(60)
         .read_timeout(60)
         .write_timeout(180)
-        .connect_timeout(30)
-        .pool_timeout(30)
+        .pool_timeout(60)
+        .get_updates_connect_timeout(60)
+        .get_updates_read_timeout(60)
+        .get_updates_write_timeout(60)
+        .get_updates_pool_timeout(60)
         .post_init(post_init)
         .build()
     )
@@ -684,8 +677,19 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(MessageHandler(filters.ALL, handle_unknown))
 
-    logger.info("Bot polling started.")
-    app.run_polling(drop_pending_updates=True)
+    if WEBHOOK_URL:
+        # ── Webhook mode  (Railway / any cloud with public URL) ──
+        logger.info("Starting in WEBHOOK mode on port %d", PORT)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=WEBHOOK_URL,
+            drop_pending_updates=True,
+        )
+    else:
+        # ── Polling mode  (local development) ───────────────────
+        logger.info("Starting in POLLING mode")
+        app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
