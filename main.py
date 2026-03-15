@@ -26,14 +26,44 @@ from telegram.error import BadRequest
 BOT_TOKEN       = "8263619482:AAF08HfJpNMnYMRZO-wkWkEq_jHVQJNvPO4"
 DOWNLOAD_FOLDER = Path("downloads")
 CACHE_FOLDER    = Path("cache")
-MAX_FILE_SIZE   = 50 * 1024 * 1024   # 50 MB Telegram bot limit
+COOKIES_FILE    = Path("cookies.txt")   # optional — export from browser
+MAX_FILE_SIZE   = 50 * 1024 * 1024      # 50 MB Telegram bot limit
 MAX_QUEUE_SIZE  = 15
 WORKERS         = 3
-RATE_LIMIT_SEC  = 8                   # seconds between requests per user
-FFMPEG_LOCATION = None                # e.g. r"C:\ffmpeg"  —  None = auto-detect
+RATE_LIMIT_SEC  = 8
+FFMPEG_LOCATION = None                  # e.g. r"C:\ffmpeg"  —  None = auto-detect
 
 DOWNLOAD_FOLDER.mkdir(exist_ok=True)
 CACHE_FOLDER.mkdir(exist_ok=True)
+
+# ╔══════════════════════════════════════════╗
+#   SHARED YT-DLP OPTIONS  (403 fix)
+# ╚══════════════════════════════════════════╝
+
+YDL_COMMON: dict = {
+    "quiet":       True,
+    "no_warnings": True,
+    "http_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["web", "android"],
+        }
+    },
+    "socket_timeout": 30,
+    "retries":        5,
+}
+
+# Attach cookies file if it exists next to the script
+if COOKIES_FILE.exists():
+    YDL_COMMON["cookiefile"] = str(COOKIES_FILE)
 
 # ╔══════════════════════════════════════════╗
 #   LOGGING
@@ -116,7 +146,6 @@ def mini_wave(frame: int, width: int = 8) -> str:
     return "".join(WAVE[(i + frame) % len(WAVE)] for i in range(width))
 
 def sanitize_title(title: str) -> str:
-    """Strip characters illegal in Windows/Linux filenames, cap length."""
     title = re.sub(r'[\\/*?:"<>|#%&{}$!\'@+`=]', "_", title)
     title = re.sub(r'\s+', " ", title).strip()
     return title[:120]
@@ -137,7 +166,7 @@ async def safe_edit(msg, text: str, **kwargs):
 # ╚══════════════════════════════════════════╝
 
 def get_video_info(url: str) -> dict:
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    opts = {**YDL_COMMON, "skip_download": True}
     if FFMPEG_LOCATION:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -152,7 +181,6 @@ def build_caption(info: dict) -> str:
     date      = info.get("upload_date", "")
     date_str  = f"{date[:4]}-{date[4:6]}-{date[6:]}" if len(date) == 8 else "—"
     extractor = info.get("extractor_key", "").upper()
-
     return (
         f"🎬 *{title}*\n\n"
         f"👤 {uploader}   📅 {date_str}\n"
@@ -167,29 +195,21 @@ def build_buttons(info: dict, url: str) -> list:
         f.get("height") for f in formats
         if f.get("height") and f.get("height") in (360, 480, 720, 1080)
     ))
-
     rows  = []
     icons = {360: "📱", 480: "💻", 720: "🖥", 1080: "📺"}
-
     vid_row = []
     for h in heights:
-        vid_row.append(
-            InlineKeyboardButton(
-                f"{icons.get(h, '📹')} {h}p",
-                callback_data=f"mp4|{h}|{url}"
-            )
-        )
+        vid_row.append(InlineKeyboardButton(
+            f"{icons.get(h, '📹')} {h}p",
+            callback_data=f"mp4|{h}|{url}"
+        ))
         if len(vid_row) == 2:
             rows.append(vid_row)
             vid_row = []
     if vid_row:
         rows.append(vid_row)
-
     if not heights:
-        rows.append([
-            InlineKeyboardButton("📹 Best quality", callback_data=f"mp4|best|{url}")
-        ])
-
+        rows.append([InlineKeyboardButton("📹 Best quality", callback_data=f"mp4|best|{url}")])
     rows.append([
         InlineKeyboardButton("🎵 MP3 128kbps", callback_data=f"mp3|128|{url}"),
         InlineKeyboardButton("🎵 MP3 320kbps", callback_data=f"mp3|320|{url}"),
@@ -235,20 +255,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cookie_status = "✅ Loaded" if COOKIES_FILE.exists() else "❌ Not found"
     text = (
         "ℹ️ *How to use*\n\n"
         "1️⃣ Paste any supported video URL\n"
         "2️⃣ Wait for the format picker\n"
         "3️⃣ Choose MP4 resolution or MP3 quality\n"
-        "4️⃣ The file is sent with the video/song title as filename\n\n"
+        "4️⃣ File is sent with the song/video title as filename\n\n"
         "⚠️ *Limits*\n"
-        f"• Max file size: `{fmt_size(MAX_FILE_SIZE)}`\n"
-        f"• Queue slots: `{MAX_QUEUE_SIZE}`\n"
-        f"• Rate limit: `{RATE_LIMIT_SEC}s` between requests\n\n"
+        f"• Max file size : `{fmt_size(MAX_FILE_SIZE)}`\n"
+        f"• Queue slots   : `{MAX_QUEUE_SIZE}`\n"
+        f"• Rate limit    : `{RATE_LIMIT_SEC}s` between requests\n\n"
         "💡 *Tips*\n"
         "• Use `MP3 320` for best audio quality\n"
         "• Use `360p` for fastest download\n"
-        "• Cached files are sent instantly ⚡"
+        "• Cached files are sent instantly ⚡\n\n"
+        f"🍪 *Cookie file* : {cookie_status}\n"
+        "_Place `cookies.txt` next to the script to bypass age/geo restrictions._"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -319,11 +342,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("Info fetch error: %s", e)
         stop_anim.set()
         anim_task.cancel()
+        err_hint = ""
+        if "403" in str(e):
+            err_hint = "\n\n💡 _Try placing `cookies.txt` next to the bot — see /help_"
+        elif "Private" in str(e) or "private" in str(e):
+            err_hint = "\n\n💡 _This video is private or age-restricted_"
         await safe_edit(
             msg,
-            "❌ *Could not fetch video info*\n\n"
-            "• Link may be private, age-restricted, or unsupported\n"
-            "• Try a direct link without extra query params",
+            f"❌ *Could not fetch video info*\n\n`{str(e)[:200]}`{err_hint}",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -444,7 +470,6 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     else:
         fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
 
-    # Named after the video/song title
     output_template = str(DOWNLOAD_FOLDER / f"{clean_title}.%(ext)s")
 
     # ── Progress hook (runs on yt-dlp thread) ────────────────────
@@ -471,7 +496,7 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
             d.get("_total_bytes_str") or
             d.get("_total_bytes_estimate_str") or "—"
         ).strip()
-        phase    = "🎵 Audio" if typ == "mp3" else "🎥 Video"
+        phase = "🎵 Audio" if typ == "mp3" else "🎥 Video"
 
         text = (
             f"{phase} — *{quality}{'kbps' if typ == 'mp3' else 'p'}*\n\n"
@@ -479,18 +504,17 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
             f"{wave}\n\n"
             f"📦 `{size_str}`   ⚡ `{speed}`   ⏱ `{eta}`"
         )
-
         loop.call_soon_threadsafe(
             asyncio.ensure_future,
             safe_edit(msg, text, parse_mode=ParseMode.MARKDOWN),
         )
 
+    # ── Build yt-dlp opts (with 403 fix merged in) ───────────────
     ydl_opts = {
+        **YDL_COMMON,
         "format":              fmt,
         "outtmpl":             output_template,
         "progress_hooks":      [hook],
-        "quiet":               True,
-        "no_warnings":         True,
         "merge_output_format": "mp4" if typ == "mp4" else None,
     }
     if FFMPEG_LOCATION:
@@ -511,9 +535,12 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
     except Exception as e:
         logger.error("Download error: %s", e)
         stats["failed"] += 1
+        err_hint = ""
+        if "403" in str(e):
+            err_hint = "\n\n💡 _Place `cookies.txt` next to the bot to fix 403 errors — see /help_"
         await safe_edit(
             msg,
-            f"❌ *Download failed*\n\n`{str(e)[:300]}`",
+            f"❌ *Download failed*\n\n`{str(e)[:300]}`{err_hint}",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -595,34 +622,25 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
 # ╚══════════════════════════════════════════╝
 
 def _run_ydl(opts: dict, url: str, typ: str, clean_title: str):
-    """
-    Runs yt-dlp synchronously. Returns the final file path as a string.
-    For MP3: postprocessor replaces the original extension with .mp3,
-    so we resolve the final path by checking the .mp3 sibling.
-    """
     with yt_dlp.YoutubeDL(opts) as ydl:
         info     = ydl.extract_info(url, download=True)
-        raw_path = ydl.prepare_filename(info)  # e.g. downloads/Song Title.webm
+        raw_path = ydl.prepare_filename(info)
 
     if typ == "mp3":
-        # After FFmpegExtractAudio the ext becomes .mp3
+        # FFmpegExtractAudio replaces the extension with .mp3
         mp3_path = Path(raw_path).with_suffix(".mp3")
         if mp3_path.exists():
             return str(mp3_path)
-
-        # Fallback: scan downloads folder for matching stem
+        # Fallback: scan folder for exact stem match
         for f in DOWNLOAD_FOLDER.iterdir():
             if f.stem == clean_title and f.suffix == ".mp3":
                 return str(f)
-
-        # Last resort: any .mp3 whose stem contains the title
+        # Last resort: partial stem match
         for f in DOWNLOAD_FOLDER.iterdir():
             if f.suffix == ".mp3" and clean_title[:20].lower() in f.stem.lower():
                 return str(f)
-
         return None
 
-    # MP4 — raw_path is the final merged file
     return raw_path if Path(raw_path).exists() else None
 
 # ╔══════════════════════════════════════════╗
@@ -643,7 +661,8 @@ async def post_init(app):
     download_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
     for i in range(WORKERS):
         asyncio.create_task(worker(i + 1))
-    logger.info("%d download workers started.", WORKERS)
+    cookie_msg = f"with cookies ({COOKIES_FILE})" if COOKIES_FILE.exists() else "without cookies"
+    logger.info("%d download workers started %s.", WORKERS, cookie_msg)
 
 def main():
     app = (
