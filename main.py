@@ -1,66 +1,73 @@
 """
-Telegram Media Downloader Bot
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-YouTube bot-detection bypass strategy (in priority order):
-  1. tv_embedded client  — no sign-in required, works from server IPs
-  2. iOS client          — mobile UA, rarely blocked
-  3. android client      — fallback with broad format support
-  4. PO token (web)      — if youtube-po-token-generator is installed
-  5. cookies.txt         — manual cookie export for age-gated content
+╔═══════════════════════════════════════════════════════════╗
+║          N E X U S - D L   //  MEDIA EXTRACTION BOT      ║
+║          v3.0  |  by  0xNEXUS  |  classified: PUBLIC     ║
+╚═══════════════════════════════════════════════════════════╝
 
-The extractor client list is tried left-to-right by yt-dlp automatically.
+  [BYPASS CHAIN]
+  tv_embedded → ios → android → mweb → android_vr
+  + PO token (web client) if youtube-po-token-generator found
+  + cookies.txt if present (strongest bypass)
+
+  [NEW FEATURES]
+  • All resolutions: 144p / 240p / 360p / 480p / 720p / 1080p / 1440p / 2160p (4K)
+  • Audio-only: MP3 128/192/320kbps + M4A best
+  • /search <query>  — search YouTube without leaving Telegram
+  • /trending        — trending YouTube videos
+  • /playlist <url>  — list & pick tracks from a playlist
+  • /info <url>      — detailed video info card (no download)
+  • /history         — your last 5 downloads
+  • /cancel          — cancel your queued download
+  • /ping            — latency check
+  • Hacker-terminal  — matrix-style progress bars & status
 """
 
-import os
-import re
-import json
-import shutil
-import asyncio
-import logging
-import time
-import hashlib
-import subprocess
+import os, re, json, shutil, asyncio, logging, time, hashlib, subprocess
 from pathlib import Path
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+)
 from telegram.ext import (
-    ApplicationBuilder,
-    MessageHandler,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, MessageHandler, CommandHandler,
+    CallbackQueryHandler, ContextTypes, filters,
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter
 
-# ╔══════════════════════════════════════════╗
-#   CONFIG  —  set via environment variables
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════
 
-BOT_TOKEN    = os.environ.get("BOT_TOKEN",    "YOUR_TOKEN")
-WEBHOOK_URL  = os.environ.get("WEBHOOK_URL",  "")
-PORT         = int(os.environ.get("PORT",     8443))
+BOT_TOKEN        = os.environ.get("BOT_TOKEN",    "YOUR_TOKEN")
+WEBHOOK_URL      = os.environ.get("WEBHOOK_URL",  "")
+PORT             = int(os.environ.get("PORT",     8443))
+ADMIN_IDS        = set(
+    int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+)
 
 DOWNLOAD_FOLDER  = Path("downloads")
 CACHE_FOLDER     = Path("cache")
 COOKIES_FILE     = Path("cookies.txt")
 MAX_FILE_SIZE    = 50 * 1024 * 1024
-MAX_QUEUE_SIZE   = 15
+MAX_QUEUE_SIZE   = 20
 WORKERS          = 3
-RATE_LIMIT_SEC   = 8
+RATE_LIMIT_SEC   = 6
 DOWNLOAD_TIMEOUT = 600
-MAX_RATE_CACHE   = 1000
+MAX_RATE_CACHE   = 2000
+MAX_HISTORY      = 5
+MAX_PLAYLIST_SHOW = 10
 FFMPEG_LOCATION  = os.environ.get("FFMPEG_LOCATION", None)
+HTTP_PROXY       = os.environ.get("HTTP_PROXY", None)
 
 DOWNLOAD_FOLDER.mkdir(exist_ok=True)
 CACHE_FOLDER.mkdir(exist_ok=True)
 
-# ╔══════════════════════════════════════════╗
-#   LOGGING
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  LOGGING
+# ═══════════════════════════════════════════════════════════
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,36 +76,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ╔══════════════════════════════════════════╗
-#   PO TOKEN  —  optional, refreshed hourly
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  PO TOKEN  —  refreshed hourly
+# ═══════════════════════════════════════════════════════════
 
-_po_token:       str | None = None
-_visitor_data:   str | None = None
+_po_token: str | None       = None
+_visitor_data: str | None   = None
 _po_token_expiry: float     = 0.0
 PO_TOKEN_TTL                = 3600
 
 def _generate_po_token() -> tuple[str | None, str | None]:
     try:
-        result = subprocess.run(
+        r = subprocess.run(
             ["youtube-po-token-generator"],
             capture_output=True, text=True, timeout=30,
         )
-        if result.returncode != 0:
-            logger.warning("PO token generator exited %d: %s",
-                           result.returncode, result.stderr.strip())
+        if r.returncode != 0:
+            logger.warning("PO token generator: exit %d — %s", r.returncode, r.stderr.strip())
             return None, None
-        data = json.loads(result.stdout)
+        data = json.loads(r.stdout)
         po   = data.get("poToken")
         vis  = data.get("visitorData")
         if po:
-            logger.info("PO token generated successfully.")
+            logger.info("▶ PO token acquired.")
         return po, vis
     except FileNotFoundError:
-        logger.info("youtube-po-token-generator not installed — PO token disabled.")
         return None, None
     except Exception as e:
-        logger.warning("PO token generation failed: %s", e)
+        logger.warning("PO token failed: %s", e)
         return None, None
 
 def get_po_token() -> tuple[str | None, str | None]:
@@ -108,26 +113,23 @@ def get_po_token() -> tuple[str | None, str | None]:
         _po_token_expiry = time.time() + PO_TOKEN_TTL
     return _po_token, _visitor_data
 
-# ╔══════════════════════════════════════════╗
-#   YT-DLP OPTIONS
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  YT-DLP CONFIG
+# ═══════════════════════════════════════════════════════════
 
-# tv_embedded: bypasses bot detection, no auth required from server IPs
-# ios: mobile client, rarely flagged by YouTube
-# android: broad format support
 _YT_CLIENTS_BASE = ["tv_embedded", "ios", "android"]
 
 def build_extractor_args() -> dict:
     po, vis = get_po_token()
     clients = list(_YT_CLIENTS_BASE)
-    yt_args: dict = {"player_client": clients}
+    yt: dict = {"player_client": clients}
     if po:
         clients.insert(0, "web")
-        yt_args["player_client"] = clients
-        yt_args["po_token"]      = [f"web+{po}"]
+        yt["player_client"] = clients
+        yt["po_token"]      = [f"web+{po}"]
     if vis:
-        yt_args["visitor_data"]  = [vis]
-    return {"youtube": yt_args}
+        yt["visitor_data"]  = [vis]
+    return {"youtube": yt}
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -137,25 +139,26 @@ _UA = (
 
 def build_ydl_common() -> dict:
     opts: dict = {
-        "quiet":           True,
-        "no_warnings":     True,
-        "http_headers": {
+        "quiet":            True,
+        "no_warnings":      True,
+        "http_headers":     {
             "User-Agent":      _UA,
             "Accept-Language": "en-US,en;q=0.9",
             "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
-        "extractor_args":  build_extractor_args(),
-        "socket_timeout":  30,
-        "retries":         5,
+        "extractor_args":   build_extractor_args(),
+        "socket_timeout":   30,
+        "retries":          5,
         "fragment_retries": 5,
     }
     if COOKIES_FILE.exists():
         opts["cookiefile"] = str(COOKIES_FILE)
     if FFMPEG_LOCATION:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
+    if HTTP_PROXY:
+        opts["proxy"] = HTTP_PROXY
     return opts
 
-# Fallback client configs tried in order when bot-detection fires
 _FALLBACK_CLIENTS: list[dict] = [
     {"youtube": {"player_client": ["tv_embedded"]}},
     {"youtube": {"player_client": ["ios"]}},
@@ -164,60 +167,102 @@ _FALLBACK_CLIENTS: list[dict] = [
     {"youtube": {"player_client": ["android_vr"]}},
 ]
 
-def _is_bot_detection_error(e: Exception) -> bool:
-    msg = str(e).lower()
-    return any(kw in msg for kw in [
-        "sign in", "signin", "bot", "confirm you", "403", "http error 429"
-    ])
+def _is_bot_block(e: Exception) -> bool:
+    m = str(e).lower()
+    return any(k in m for k in ["sign in", "signin", "bot", "confirm you", "403", "429"])
 
-# ╔══════════════════════════════════════════╗
-#   GLOBALS
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  GLOBALS
+# ═══════════════════════════════════════════════════════════
 
-download_queue:    asyncio.Queue    = None
-active_downloads:  dict[int, str]   = {}
-user_last_request: OrderedDict      = OrderedDict()
+download_queue:    asyncio.Queue           = None
+active_downloads:  dict[int, str]          = {}
+user_last_request: OrderedDict             = OrderedDict()
+# user_id → list of dicts {title, typ, quality, ts}
+user_history:      dict[int, list]         = defaultdict(list)
+# user_id → queue item (for /cancel)
+user_queue_item:   dict[int, asyncio.Task] = {}
 
 stats = {
     "users":      set(),
     "downloads":  0,
     "failed":     0,
+    "bytes_sent": 0,
     "start_time": time.time(),
 }
 
-SPINNER = ["◐", "◓", "◑", "◒"]
-WAVE    = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃", "▂"]
-FETCHING_FRAMES = [
-    "🔍 Fetching info{dots}",
-    "📡 Connecting{dots}",
-    "🌐 Retrieving metadata{dots}",
+# ═══════════════════════════════════════════════════════════
+#  HACKER-STYLE ANIMATIONS  ("terminal" aesthetic)
+# ═══════════════════════════════════════════════════════════
+
+# Monospace block chars for progress bar
+_BAR_FULL  = "█"
+_BAR_HEAD  = "▓"
+_BAR_EMPTY = "░"
+
+# Spinning "radar sweep"
+_RADAR = ["◜", "◝", "◞", "◟"]
+_SCAN  = ["▰▱▱▱▱▱▱▱", "▰▰▱▱▱▱▱▱", "▰▰▰▱▱▱▱▱", "▰▰▰▰▱▱▱▱",
+          "▰▰▰▰▰▱▱▱", "▰▰▰▰▰▰▱▱", "▰▰▰▰▰▰▰▱", "▰▰▰▰▰▰▰▰"]
+
+_FETCH_LINES = [
+    "initializing extraction protocol{d}",
+    "probing target endpoint{d}",
+    "negotiating media stream{d}",
+    "decrypting stream tokens{d}",
+    "resolving CDN nodes{d}",
+    "bypassing geo-filters{d}",
+    "mapping format matrix{d}",
 ]
 
-# ╔══════════════════════════════════════════╗
-#   HELPERS
-# ╚══════════════════════════════════════════╝
+_DL_PHASES = [
+    "INTERCEPTING STREAM",
+    "PULLING FRAGMENTS",
+    "STITCHING SEGMENTS",
+    "MUXING CONTAINER",
+    "VERIFYING PAYLOAD",
+]
+
+def _hbar(pct: float, width: int = 16) -> str:
+    filled = int(pct / 100 * width)
+    head   = 1 if filled < width else 0
+    empty  = width - filled - head
+    return _BAR_FULL * filled + (_BAR_HEAD if head else "") + _BAR_EMPTY * max(empty, 0)
+
+def _phase(pct: float) -> str:
+    idx = min(int(pct / 100 * len(_DL_PHASES)), len(_DL_PHASES) - 1)
+    return _DL_PHASES[idx]
+
+def _glitch(text: str, frame: int) -> str:
+    """Occasionally corrupt one char for a glitch effect (frame-based)."""
+    glitch_chars = "▒░▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌"
+    if frame % 7 == 0 and len(text) > 4:
+        pos = (frame * 3) % len(text)
+        c   = glitch_chars[(frame * 13) % len(glitch_chars)]
+        return text[:pos] + c + text[pos + 1:]
+    return text
+
+# ═══════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════
 
 def fmt_size(n: float) -> str:
-    for unit in ["B", "KB", "MB", "GB"]:
-        if n < 1024:
-            return f"{n:.1f} {unit}"
+    for u in ["B", "KB", "MB", "GB"]:
+        if n < 1024: return f"{n:.1f} {u}"
         n /= 1024
     return f"{n:.1f} TB"
 
-def fmt_duration(sec: int) -> str:
-    h, r = divmod(sec, 3600)
-    m, s = divmod(r, 60)
+def fmt_dur(sec: int) -> str:
+    h, r = divmod(sec, 3600); m, s = divmod(r, 60)
     return (f"{h}h " if h else "") + (f"{m}m " if m else "") + f"{s}s"
 
 def fmt_views(n: int) -> str:
-    if n >= 1_000_000: return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:     return f"{n / 1_000:.1f}K"
+    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:     return f"{n/1_000:.1f}K"
     return str(n)
 
 def fmt_uptime(sec: int) -> str:
-    d, r = divmod(sec, 86400)
-    h, r = divmod(r, 3600)
-    m, s = divmod(r, 60)
+    d, r = divmod(sec, 86400); h, r = divmod(r, 3600); m, s = divmod(r, 60)
     parts = []
     if d: parts.append(f"{d}d")
     if h: parts.append(f"{h}h")
@@ -225,252 +270,554 @@ def fmt_uptime(sec: int) -> str:
     parts.append(f"{s}s")
     return " ".join(parts)
 
-def rich_progress_bar(pct: float, width: int = 14) -> str:
-    filled    = int(pct / 100 * width)
-    empty     = width - filled
-    fill_char = "▓" if pct < 33 else ("█" if pct < 66 else "▉")
-    return fill_char * filled + "░" * empty
-
-def mini_wave(frame: int, width: int = 8) -> str:
-    return "".join(WAVE[(i + frame) % len(WAVE)] for i in range(width))
-
-def sanitize_title(title: str) -> str:
+def sanitize(title: str) -> str:
     title = re.sub(r'[\\/*?:"<>|#%&{}$!\'@+`=]', "_", title)
-    title = re.sub(r'\s+', " ", title).strip()
-    return title[:120]
+    return re.sub(r'\s+', " ", title).strip()[:120]
 
-def cache_key(url: str, typ: str, quality: str) -> str:
-    h = hashlib.md5(f"{url}|{typ}|{quality}".encode()).hexdigest()[:12]
-    return f"{h}_{typ}_{quality}"
+def ckey(url: str, typ: str, q: str) -> str:
+    return hashlib.md5(f"{url}|{typ}|{q}".encode()).hexdigest()[:12] + f"_{typ}_{q}"
 
-async def safe_edit(msg, text: str, **kwargs):
+def mdescape(t: str) -> str:
+    return re.sub(r'([_*\[\]()~`>#+=|{}.!\\-])', r'\\\1', t)
+
+async def safe_edit(msg, text: str, **kw):
     try:
-        await msg.edit_text(text, **kwargs)
+        await msg.edit_text(text, **kw)
     except RetryAfter as e:
         await asyncio.sleep(e.retry_after + 0.5)
-        try:
-            await msg.edit_text(text, **kwargs)
-        except Exception:
-            pass
+        try: await msg.edit_text(text, **kw)
+        except Exception: pass
     except BadRequest as e:
         if "not modified" not in str(e).lower():
-            logger.debug("Edit skipped: %s", e)
+            logger.debug("edit skip: %s", e)
     except NetworkError as e:
-        logger.debug("Network error on edit: %s", e)
+        logger.debug("net err: %s", e)
 
-def record_rate_limit(user: int) -> None:
+def record_rl(user: int):
     user_last_request[user] = time.time()
     user_last_request.move_to_end(user)
     while len(user_last_request) > MAX_RATE_CACHE:
         user_last_request.popitem(last=False)
 
-def user_facing_error(e: Exception) -> str:
-    msg = str(e)
-    low = msg.lower()
-    if any(kw in low for kw in ["sign in", "bot", "confirm you"]):
+def push_history(user: int, title: str, typ: str, quality: str):
+    h = user_history[user]
+    h.append({"title": title[:50], "typ": typ, "quality": quality, "ts": int(time.time())})
+    if len(h) > MAX_HISTORY:
+        h.pop(0)
+
+def error_msg(e: Exception) -> str:
+    m = str(e); low = m.lower()
+    if any(k in low for k in ["sign in", "bot", "confirm you"]):
         return (
-            "❌ *YouTube blocked the download.*\n\n"
-            "The bot tried multiple clients \\(tv\\_embedded, iOS, Android\\) "
-            "but YouTube still requires authentication from this server IP\\.\n\n"
-            "✅ *Fix options:*\n"
-            "1\\. Add `cookies\\.txt` — export with:\n"
-            "`yt\\-dlp \\-\\-cookies\\-from\\-browser chrome \\-\\-cookies cookies\\.txt`\n"
-            "2\\. Install `youtube\\-po\\-token\\-generator`\n"
-            "3\\. Set `HTTP_PROXY` env var to a residential proxy"
+            "```\n[ACCESS DENIED]\n```\n"
+            "⛔ *YouTube requires authentication*\n\n"
+            "The bot exhausted all bypass clients\\.\n\n"
+            "*Fix:*\n"
+            "1\\. Export cookies: `yt\\-dlp \\-\\-cookies\\-from\\-browser chrome \\-\\-cookies cookies\\.txt`\n"
+            "2\\. Place `cookies\\.txt` next to `bot\\.py`\n"
+            "3\\. Install `youtube\\-po\\-token\\-generator`"
         )
-    if "403" in msg:
-        return "❌ *HTTP 403* — server IP blocked\\. Add cookies or a proxy\\."
-    if "429" in msg:
-        return "❌ *Rate limited \\(429\\)* — wait a few minutes and try again\\."
-    if "not available" in low:
-        return "❌ *Format not available\\.* Try a different resolution\\."
-    if "private" in low:
-        return "❌ *Video is private or age\\-restricted\\.* Add authenticated cookies\\."
-    if "geo" in low or "not available in your country" in low:
-        return "❌ *Video is geo\\-restricted* in the server's region\\."
-    if "copyright" in low:
-        return "❌ *Video blocked* due to a copyright claim\\."
-    safe_msg = re.sub(r'([_*\[\]()~`>#+=|{}.!\\-])', r'\\\1', msg[:300])
-    return f"❌ *Download failed*\n\n`{safe_msg}`"
+    if "403" in m:   return "```\n[ERR 403 FORBIDDEN]\n```\nServer IP blocked\\. Use cookies or proxy\\."
+    if "429" in m:   return "```\n[ERR 429 RATE LIMIT]\n```\nToo many requests\\. Wait a few minutes\\."
+    if "private" in low: return "```\n[LOCKED CONTENT]\n```\nVideo is private or age\\-restricted\\."
+    if "geo" in low: return "```\n[GEO BLOCK]\n```\nVideo is unavailable in the server region\\."
+    if "copyright" in low: return "```\n[DMCA BLOCK]\n```\nVideo blocked due to copyright\\."
+    return f"```\n[DOWNLOAD FAILED]\n{mdescape(m[:250])}\n```"
 
-# ╔══════════════════════════════════════════╗
-#   VIDEO INFO  —  with client fallback
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  VIDEO INFO  —  with client fallback chain
+# ═══════════════════════════════════════════════════════════
 
-def _get_info_with_opts(url: str, opts: dict) -> dict:
+def _info(url: str, opts: dict) -> dict:
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 def get_video_info(url: str) -> dict:
-    """Try primary client config, then fall back through _FALLBACK_CLIENTS."""
-    primary_opts = {**build_ydl_common(), "skip_download": True}
+    base = {**build_ydl_common(), "skip_download": True}
     try:
-        return _get_info_with_opts(url, primary_opts)
+        return _info(url, base)
     except Exception as e:
-        if not _is_bot_detection_error(e):
-            raise
-        logger.warning("Primary client blocked (%s) — trying fallbacks…", e)
+        if not _is_bot_block(e): raise
+        logger.warning("Primary client blocked — falling back…")
 
-    for i, fb_args in enumerate(_FALLBACK_CLIENTS):
+    for i, fb in enumerate(_FALLBACK_CLIENTS):
         try:
-            opts = {**primary_opts, "extractor_args": fb_args}
-            info = _get_info_with_opts(url, opts)
-            logger.info("Fallback client #%d succeeded for info fetch.", i + 1)
+            info = _info(url, {**base, "extractor_args": fb})
+            logger.info("Fallback #%d succeeded (info).", i + 1)
             return info
         except Exception as fe:
-            logger.debug("Fallback #%d failed: %s", i + 1, fe)
+            logger.debug("Fallback #%d info fail: %s", i + 1, fe)
 
-    raise Exception(
-        "YouTube requires sign-in and no working client was found. "
-        "Please add cookies.txt — see /help for instructions."
-    )
+    raise Exception("All bypass clients failed. Add cookies.txt — see /help.")
+
+# ═══════════════════════════════════════════════════════════
+#  FORMAT / BUTTON BUILDER
+# ═══════════════════════════════════════════════════════════
+
+# All resolutions we want to offer
+_ALL_HEIGHTS = [144, 240, 360, 480, 720, 1080, 1440, 2160]
+_RES_ICONS   = {
+    144:  "📺",
+    240:  "📺",
+    360:  "📱",
+    480:  "💻",
+    720:  "🖥",
+    1080: "🖥",
+    1440: "🔲",
+    2160: "🎞",
+}
+_RES_LABELS = {
+    144:  "144p",
+    240:  "240p",
+    360:  "360p",
+    480:  "480p",
+    720:  "720p HD",
+    1080: "1080p FHD",
+    1440: "1440p QHD",
+    2160: "2160p 4K",
+}
 
 def build_caption(info: dict) -> str:
-    title     = info.get("title", "Unknown")[:60]
-    uploader  = info.get("uploader") or info.get("channel") or "—"
-    duration  = fmt_duration(info.get("duration") or 0)
-    views     = fmt_views(info.get("view_count") or 0)
-    likes     = fmt_views(info.get("like_count") or 0)
-    date      = info.get("upload_date", "")
-    date_str  = f"{date[:4]}-{date[4:6]}-{date[6:]}" if len(date) == 8 else "—"
-    extractor = info.get("extractor_key", "").upper()
+    title    = sanitize(info.get("title", "Unknown"))[:55]
+    uploader = info.get("uploader") or info.get("channel") or "—"
+    dur      = fmt_dur(info.get("duration") or 0)
+    views    = fmt_views(info.get("view_count") or 0)
+    likes    = fmt_views(info.get("like_count") or 0)
+    date     = info.get("upload_date", "")
+    ds       = f"{date[:4]}-{date[4:6]}-{date[6:]}" if len(date) == 8 else "—"
+    ext      = info.get("extractor_key", "").upper()
+    desc     = (info.get("description") or "")[:120].replace("\n", " ")
     return (
-        f"🎬 *{title}*\n\n"
-        f"👤 {uploader}   📅 {date_str}\n"
-        f"⏱ {duration}   👁 {views}   👍 {likes}\n"
-        f"🔗 {extractor}\n\n"
-        f"*Choose a format:*"
+        f"```\n╔{'═'*40}\n"
+        f"║ {title}\n"
+        f"╠{'═'*40}\n"
+        f"║ SRC  : {ext}\n"
+        f"║ BY   : {uploader[:30]}\n"
+        f"║ DATE : {ds}\n"
+        f"║ DUR  : {dur}\n"
+        f"║ VIEWS: {views}   LIKES: {likes}\n"
+        f"╚{'═'*40}\n```\n"
+        f"_{desc}_\n\n"
+        f"*SELECT OUTPUT FORMAT:*"
     )
 
 def build_buttons(info: dict, url: str) -> list:
     formats  = info.get("formats", [])
-    heights  = sorted(set(
-        f.get("height") for f in formats
-        if f.get("height") and f.get("height") in (360, 480, 720, 1080)
-    ))
     safe_url = url.replace("|", "%7C")
-    rows     = []
-    icons    = {360: "📱", 480: "💻", 720: "🖥", 1080: "📺"}
-    vid_row  = []
+
+    # Detect available heights from formats
+    available = set()
+    for f in formats:
+        h = f.get("height")
+        if h and isinstance(h, int):
+            # Round to nearest standard height
+            for std in _ALL_HEIGHTS:
+                if abs(h - std) <= 20:
+                    available.add(std)
+                    break
+
+    # Always offer at least 360p as fallback
+    if not available:
+        available.add(360)
+
+    heights = sorted(available)
+    rows    = []
+
+    # Video buttons — 2 per row
+    vid_row = []
     for h in heights:
-        vid_row.append(InlineKeyboardButton(
-            f"{icons.get(h, '📹')} {h}p",
-            callback_data=f"mp4|{h}|{safe_url}"
-        ))
+        lbl = f"{_RES_ICONS.get(h,'📹')} {_RES_LABELS.get(h, f'{h}p')}"
+        vid_row.append(InlineKeyboardButton(lbl, callback_data=f"mp4|{h}|{safe_url}"))
         if len(vid_row) == 2:
-            rows.append(vid_row)
-            vid_row = []
+            rows.append(vid_row); vid_row = []
     if vid_row:
         rows.append(vid_row)
-    if not heights:
-        rows.append([InlineKeyboardButton(
-            "📹 Best quality", callback_data=f"mp4|best|{safe_url}"
-        )])
+
+    # Best-quality shortcut
     rows.append([
-        InlineKeyboardButton("🎵 MP3 128kbps", callback_data=f"mp3|128|{safe_url}"),
-        InlineKeyboardButton("🎵 MP3 320kbps", callback_data=f"mp3|320|{safe_url}"),
+        InlineKeyboardButton("🏆 Best Video+Audio", callback_data=f"mp4|best|{safe_url}")
     ])
-    rows.append([InlineKeyboardButton("❌  Cancel", callback_data="cancel")])
+
+    # Audio buttons
+    rows.append([
+        InlineKeyboardButton("🎵 MP3 128k", callback_data=f"mp3|128|{safe_url}"),
+        InlineKeyboardButton("🎵 MP3 192k", callback_data=f"mp3|192|{safe_url}"),
+        InlineKeyboardButton("🎵 MP3 320k", callback_data=f"mp3|320|{safe_url}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("🎶 M4A Best",  callback_data=f"m4a|best|{safe_url}"),
+        InlineKeyboardButton("🎙 OGG Best",  callback_data=f"ogg|best|{safe_url}"),
+    ])
+    rows.append([InlineKeyboardButton("✖ ABORT", callback_data="cancel")])
     return rows
 
-# ╔══════════════════════════════════════════╗
-#   ANIMATED FETCH STATUS
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  ANIMATED FETCH  (hacker terminal style)
+# ═══════════════════════════════════════════════════════════
 
-async def animated_fetch(msg, stop_event: asyncio.Event):
+async def animated_fetch(msg, stop: asyncio.Event):
     frame = 0
-    fidx  = 0
-    while not stop_event.is_set():
-        dots = "." * (frame % 4)
-        text = FETCHING_FRAMES[fidx % len(FETCHING_FRAMES)].format(dots=dots)
-        spin = SPINNER[frame % len(SPINNER)]
-        await safe_edit(msg, f"{spin} _{text}_", parse_mode=ParseMode.MARKDOWN)
+    while not stop.is_set():
+        radar = _RADAR[frame % len(_RADAR)]
+        scan  = _SCAN[frame % len(_SCAN)]
+        line  = _FETCH_LINES[frame % len(_FETCH_LINES)].format(d="." * (frame % 4))
+        glitched = _glitch(line, frame)
+        text = (
+            f"```\n"
+            f"[{radar}] NEXUS-DL // EXTRACTION ENGINE\n"
+            f"{'─'*34}\n"
+            f"SCAN  {scan}\n"
+            f"PROC  {glitched}\n"
+            f"```"
+        )
+        await safe_edit(msg, text, parse_mode=ParseMode.MARKDOWN_V2)
         frame += 1
-        if frame % 4 == 0:
-            fidx += 1
-        await asyncio.sleep(0.7)
+        await asyncio.sleep(0.65)
 
-# ╔══════════════════════════════════════════╗
-#   COMMANDS
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  COMMANDS
+# ═══════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats["users"].add(update.effective_user.id)
+    name = update.effective_user.first_name or "AGENT"
     await update.message.reply_text(
-        "🎬 *Media Downloader Bot*\n\n"
-        "Supported sites:\n"
-        "• YouTube  • TikTok  • Instagram\n"
-        "• Facebook  • Twitter/X  • Reddit\n"
-        "• SoundCloud  • Twitch  • Vimeo\n\n"
-        "Just paste a link and choose your format\\!\n\n"
-        "📋 _Commands:_\n"
-        "`/queue` — queue status\n"
-        "`/stats` — bot statistics\n"
-        "`/help`  — usage guide",
+        f"```\n"
+        f"╔══════════════════════════════════════╗\n"
+        f"║   N E X U S - D L  //  v3.0         ║\n"
+        f"║   MEDIA EXTRACTION SYSTEM ONLINE     ║\n"
+        f"╠══════════════════════════════════════╣\n"
+        f"║  AGENT AUTHENTICATED: {name[:14]:<14} ║\n"
+        f"╚══════════════════════════════════════╝\n"
+        f"```\n"
+        f"*TARGET PLATFORMS:*\n"
+        f"`YouTube` `TikTok` `Instagram` `Twitter/X`\n"
+        f"`Facebook` `Reddit` `SoundCloud` `Twitch` `Vimeo`\n\n"
+        f"*COMMANDS:*\n"
+        f"`/search` — search YouTube\n"
+        f"`/info`   — inspect target URL\n"
+        f"`/playlist` — extract playlist\n"
+        f"`/trending` — trending videos\n"
+        f"`/history` — your download log\n"
+        f"`/queue`  — mission queue status\n"
+        f"`/stats`  — system telemetry\n"
+        f"`/ping`   — latency check\n"
+        f"`/help`   — operator manual\n\n"
+        f"_Drop any URL to begin extraction_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t0  = time.monotonic()
+    msg = await update.message.reply_text("```\n[PING] measuring...\n```", parse_mode=ParseMode.MARKDOWN_V2)
+    ms  = int((time.monotonic() - t0) * 1000)
+    bar = ("█" * min(ms // 10, 20)).ljust(20, "░")
+    quality = "OPTIMAL" if ms < 200 else ("NOMINAL" if ms < 500 else "DEGRADED")
+    await msg.edit_text(
+        f"```\n"
+        f"[LATENCY CHECK]\n"
+        f"RTT   : {ms}ms\n"
+        f"BAR   : {bar}\n"
+        f"STATUS: {quality}\n"
+        f"```",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    po, _         = get_po_token()
-    mode          = "Webhook" if WEBHOOK_URL else "Polling"
-    cookie_status = "✅ Loaded" if COOKIES_FILE.exists() else "❌ Not found"
-    po_status     = "✅ Active" if po else "❌ Not available"
+    po, _  = get_po_token()
+    mode   = "WEBHOOK" if WEBHOOK_URL else "POLLING"
+    ck     = "LOADED ✅" if COOKIES_FILE.exists() else "ABSENT ⚠"
+    pk     = "ACTIVE ✅" if po else "OFFLINE ✗"
+    proxy  = "ACTIVE ✅" if HTTP_PROXY else "DIRECT"
     await update.message.reply_text(
-        "ℹ️ *How to use*\n\n"
-        "1️⃣ Paste any supported video URL\n"
-        "2️⃣ Wait for the format picker\n"
-        "3️⃣ Choose MP4 resolution or MP3 quality\n"
-        "4️⃣ File is sent with the song/video title as filename\n\n"
-        "⚠️ *Limits*\n"
-        f"• Max file size : `{fmt_size(MAX_FILE_SIZE)}`\n"
-        f"• Queue slots   : `{MAX_QUEUE_SIZE}`\n"
-        f"• Rate limit    : `{RATE_LIMIT_SEC}s` between requests\n\n"
-        "🛡 *YouTube bot-detection fix*\n"
-        "If YouTube blocks downloads, export cookies from your browser:\n"
-        "`yt-dlp --cookies-from-browser chrome --cookies cookies.txt`\n"
-        "Then place `cookies.txt` next to `bot.py`.\n\n"
-        "💡 *Tips*\n"
-        "• `MP3 320` = best audio quality\n"
-        "• `360p` = fastest video download\n"
-        "• Cached files are sent instantly ⚡\n\n"
-        f"🔌 *Mode*       : `{mode}`\n"
-        f"🔑 *PO Token*   : {po_status}\n"
-        f"🍪 *Cookies*    : {cookie_status}",
+        f"```\n"
+        f"╔═══════════════════════════════════╗\n"
+        f"║  NEXUS-DL  //  OPERATOR MANUAL   ║\n"
+        f"╠═══════════════════════════════════╣\n"
+        f"║  SYSTEM STATUS                   ║\n"
+        f"║  mode    : {mode:<22}║\n"
+        f"║  po_token: {pk:<22}║\n"
+        f"║  cookies : {ck:<22}║\n"
+        f"║  proxy   : {proxy:<22}║\n"
+        f"╠═══════════════════════════════════╣\n"
+        f"║  LIMITS                          ║\n"
+        f"║  max_file : {fmt_size(MAX_FILE_SIZE):<22}║\n"
+        f"║  queue    : {MAX_QUEUE_SIZE:<22}║\n"
+        f"║  rate     : {RATE_LIMIT_SEC}s cooldown{'':<13}║\n"
+        f"╠═══════════════════════════════════╣\n"
+        f"║  FORMATS                         ║\n"
+        f"║  video: 144/240/360/480/720/      ║\n"
+        f"║         1080/1440/2160(4K)        ║\n"
+        f"║  audio: MP3(128/192/320k)         ║\n"
+        f"║         M4A best, OGG best        ║\n"
+        f"╠═══════════════════════════════════╣\n"
+        f"║  BOT-BYPASS CHAIN                ║\n"
+        f"║  tv_embedded → ios → android     ║\n"
+        f"║  → mweb → android_vr             ║\n"
+        f"╚═══════════════════════════════════╝\n"
+        f"```\n"
+        f"*Cookie fix:*\n"
+        f"`yt-dlp --cookies-from-browser chrome --cookies cookies.txt`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uptime = int(time.time() - stats["start_time"])
-    total  = stats["downloads"] + stats["failed"]
-    rate   = (stats["downloads"] / total * 100) if total else 0
-    qsize  = download_queue.qsize() if download_queue else 0
+    up    = int(time.time() - stats["start_time"])
+    total = stats["downloads"] + stats["failed"]
+    rate  = (stats["downloads"] / total * 100) if total else 0
+    qsize = download_queue.qsize() if download_queue else 0
+    mb    = stats["bytes_sent"] / (1024 * 1024)
+    run_bar = ("▰" * len(active_downloads)).ljust(WORKERS, "▱")
     await update.message.reply_text(
-        f"📊 *Bot Statistics*\n\n"
-        f"👥 Unique users : `{len(stats['users'])}`\n"
-        f"✅ Downloads    : `{stats['downloads']}`\n"
-        f"❌ Failed       : `{stats['failed']}`\n"
-        f"📈 Success rate : `{rate:.1f}%`\n"
-        f"⏳ Queue now    : `{qsize}`\n"
-        f"⚡ Workers      : `{WORKERS}`\n"
-        f"🕐 Uptime       : `{fmt_uptime(uptime)}`",
-        parse_mode=ParseMode.MARKDOWN,
+        f"```\n"
+        f"╔════════════════════════════════╗\n"
+        f"║  NEXUS-DL  //  TELEMETRY      ║\n"
+        f"╠════════════════════════════════╣\n"
+        f"║  uptime  : {fmt_uptime(up):<20}║\n"
+        f"║  users   : {len(stats['users']):<20}║\n"
+        f"║  success : {stats['downloads']:<20}║\n"
+        f"║  failed  : {stats['failed']:<20}║\n"
+        f"║  rate    : {rate:<19.1f}%║\n"
+        f"║  data_tx : {mb:<17.1f} MB ║\n"
+        f"║  queue   : {qsize:<20}║\n"
+        f"║  workers : [{run_bar}] {len(active_downloads)}/{WORKERS}  ║\n"
+        f"╚════════════════════════════════╝\n"
+        f"```",
+        parse_mode=ParseMode.MARKDOWN_V2,
     )
 
 async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    running = len(active_downloads)
-    bar_run = "🟢" * running + "⚪" * max(0, WORKERS - running)
-    qsize   = download_queue.qsize() if download_queue else 0
+    qsize = download_queue.qsize() if download_queue else 0
+    run   = len(active_downloads)
+    w_bar = ("▰" * run).ljust(WORKERS, "▱")
+    q_bar = ("█" * min(qsize, 10)).ljust(10, "░")
     await update.message.reply_text(
-        f"📋 *Queue Status*\n\n"
-        f"🔄 Running  : {bar_run} `{running}/{WORKERS}`\n"
-        f"⏳ Pending  : `{qsize}`\n"
-        f"🔢 Capacity : `{MAX_QUEUE_SIZE}`",
-        parse_mode=ParseMode.MARKDOWN,
+        f"```\n"
+        f"[MISSION QUEUE]\n"
+        f"workers  [{w_bar}] {run}/{WORKERS}\n"
+        f"pending  [{q_bar}] {qsize}/{MAX_QUEUE_SIZE}\n"
+        f"```",
+        parse_mode=ParseMode.MARKDOWN_V2,
     )
 
-# ╔══════════════════════════════════════════╗
-#   LINK HANDLER
-# ╚══════════════════════════════════════════╝
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    h   = user_history.get(uid, [])
+    if not h:
+        await update.message.reply_text(
+            "```\n[HISTORY LOG — EMPTY]\nNo downloads recorded yet.\n```",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+    lines = ["```", "[RECENT DOWNLOADS]", "─" * 32]
+    for i, entry in enumerate(reversed(h), 1):
+        ts  = time.strftime("%m-%d %H:%M", time.localtime(entry["ts"]))
+        typ = entry["typ"].upper()
+        q   = entry["quality"]
+        lines.append(f"#{i} [{ts}] {typ}/{q}")
+        lines.append(f"   {entry['title'][:30]}")
+    lines.append("```")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "```\n[USAGE]\n/info <url>\n```", parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+    url = args[0].strip()
+    msg = await update.message.reply_text(
+        "```\n[SCANNING TARGET...]\n```", parse_mode=ParseMode.MARKDOWN_V2
+    )
+    try:
+        info = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, get_video_info, url),
+            timeout=30,
+        )
+    except Exception as e:
+        await safe_edit(msg, f"```\n[SCAN FAILED]\n{mdescape(str(e)[:200])}\n```",
+                        parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    fmts    = info.get("formats", [])
+    heights = sorted(set(f.get("height") for f in fmts if f.get("height")))
+    codecs  = sorted(set(f.get("vcodec","").split(".")[0] for f in fmts if f.get("vcodec") and f.get("vcodec") != "none"))
+    acodecs = sorted(set(f.get("acodec","").split(".")[0] for f in fmts if f.get("acodec") and f.get("acodec") != "none"))
+    title   = sanitize(info.get("title","?"))[:40]
+    ch      = info.get("uploader") or info.get("channel") or "?"
+    dur     = fmt_dur(info.get("duration") or 0)
+    views   = fmt_views(info.get("view_count") or 0)
+    likes   = fmt_views(info.get("like_count") or 0)
+    tags    = ", ".join((info.get("tags") or [])[:5]) or "—"
+
+    await safe_edit(
+        msg,
+        f"```\n"
+        f"╔══════════════════════════════════╗\n"
+        f"║  TARGET ANALYSIS COMPLETE        ║\n"
+        f"╠══════════════════════════════════╣\n"
+        f"║ TITLE  : {title[:34]:<34}║\n"
+        f"║ CH     : {ch[:34]:<34}║\n"
+        f"║ DUR    : {dur:<34}║\n"
+        f"║ VIEWS  : {views:<34}║\n"
+        f"║ LIKES  : {likes:<34}║\n"
+        f"╠══════════════════════════════════╣\n"
+        f"║ V.RES  : {str(heights)[:34]:<34}║\n"
+        f"║ V.CODEC: {str(codecs)[:34]:<34}║\n"
+        f"║ A.CODEC: {str(acodecs)[:34]:<34}║\n"
+        f"║ TAGS   : {tags[:34]:<34}║\n"
+        f"║ FORMATS: {len(fmts):<34}║\n"
+        f"╚══════════════════════════════════╝\n"
+        f"```",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.message.reply_text(
+            "```\n[USAGE]\n/search <keywords>\n```", parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+
+    msg = await update.message.reply_text(
+        f"```\n[SEARCHING YT]\nquery: {mdescape(query[:40])}\n```",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    def _do_search():
+        opts = {**build_ydl_common(), "skip_download": True, "quiet": True,
+                "extract_flat": True, "playlistend": 8}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(f"ytsearch8:{query}", download=False)
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _do_search),
+            timeout=30,
+        )
+    except Exception as e:
+        await safe_edit(msg, f"```\n[SEARCH FAILED]\n{mdescape(str(e)[:150])}\n```",
+                        parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    entries = results.get("entries") or []
+    if not entries:
+        await safe_edit(msg, "```\n[NO RESULTS FOUND]\n```", parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    lines   = ["```", f"[RESULTS: {len(entries)}]", f"query: {query[:35]}", "─" * 36]
+    buttons = []
+    for i, e in enumerate(entries[:8], 1):
+        title = sanitize(e.get("title","?"))[:38]
+        dur   = fmt_dur(e.get("duration") or 0)
+        lines.append(f"[{i}] {title}")
+        lines.append(f"     ⏱ {dur}")
+        url   = e.get("url") or f"https://youtube.com/watch?v={e.get('id','')}"
+        safe_url = url.replace("|", "%7C")
+        buttons.append([InlineKeyboardButton(
+            f"[{i}] {title[:30]}",
+            callback_data=f"fetch|{safe_url}"
+        )])
+    lines.append("```")
+    buttons.append([InlineKeyboardButton("✖ Close", callback_data="cancel")])
+
+    await safe_edit(msg, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=InlineKeyboardMarkup(buttons))
+
+async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text(
+        "```\n[PULLING TRENDING FEED...]\n```", parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+    def _trend():
+        opts = {**build_ydl_common(), "skip_download": True,
+                "extract_flat": True, "playlistend": 10}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info("https://www.youtube.com/feed/trending", download=False)
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _trend),
+            timeout=30,
+        )
+    except Exception as e:
+        await safe_edit(msg, f"```\n[FEED UNAVAILABLE]\n{mdescape(str(e)[:150])}\n```",
+                        parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    entries = (results.get("entries") or [])[:10]
+    lines   = ["```", "[TRENDING  //  YOUTUBE]", "─" * 36]
+    buttons = []
+    for i, e in enumerate(entries, 1):
+        title = sanitize(e.get("title","?"))[:38]
+        lines.append(f"[{i}] {title}")
+        url      = e.get("url") or f"https://youtube.com/watch?v={e.get('id','')}"
+        safe_url = url.replace("|", "%7C")
+        buttons.append([InlineKeyboardButton(
+            f"#{i} {title[:30]}",
+            callback_data=f"fetch|{safe_url}"
+        )])
+    lines.append("```")
+    buttons.append([InlineKeyboardButton("✖ Close", callback_data="cancel")])
+
+    await safe_edit(msg, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=InlineKeyboardMarkup(buttons))
+
+async def cmd_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "```\n[USAGE]\n/playlist <url>\n```", parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+    url = args[0].strip()
+    msg = await update.message.reply_text(
+        "```\n[PARSING PLAYLIST...]\n```", parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+    def _pl():
+        opts = {**build_ydl_common(), "skip_download": True,
+                "extract_flat": True, "playlistend": MAX_PLAYLIST_SHOW}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    try:
+        info = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _pl),
+            timeout=40,
+        )
+    except Exception as e:
+        await safe_edit(msg, f"```\n[PLAYLIST PARSE FAILED]\n{mdescape(str(e)[:150])}\n```",
+                        parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    entries = info.get("entries") or []
+    pl_title = sanitize(info.get("title","Playlist"))[:30]
+    lines    = ["```", f"[PLAYLIST: {pl_title}]",
+                f"tracks shown: {len(entries)}", "─" * 36]
+    buttons  = []
+    for i, e in enumerate(entries, 1):
+        title    = sanitize(e.get("title","?"))[:38]
+        dur      = fmt_dur(e.get("duration") or 0)
+        lines.append(f"[{i}] {title[:36]}")
+        lines.append(f"     ⏱ {dur}")
+        vid_url  = e.get("url") or f"https://youtube.com/watch?v={e.get('id','')}"
+        safe_url = vid_url.replace("|", "%7C")
+        buttons.append([InlineKeyboardButton(
+            f"[{i}] {title[:30]}",
+            callback_data=f"fetch|{safe_url}"
+        )])
+    lines.append("```")
+    buttons.append([InlineKeyboardButton("✖ Close", callback_data="cancel")])
+
+    await safe_edit(msg, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=InlineKeyboardMarkup(buttons))
+
+# ═══════════════════════════════════════════════════════════
+#  LINK HANDLER
+# ═══════════════════════════════════════════════════════════
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url  = update.message.text.strip()
@@ -478,31 +825,34 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not re.match(r"https?://", url):
         await update.message.reply_text(
-            "❓ Send a valid video URL or use /help for instructions."
+            "```\n[INVALID INPUT]\nExpected: https://...\nType /help for help.\n```",
+            parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
 
     now  = time.time()
     last = user_last_request.get(user, 0)
     if now - last < RATE_LIMIT_SEC:
-        remaining = int(RATE_LIMIT_SEC - (now - last))
+        cd = int(RATE_LIMIT_SEC - (now - last))
         await update.message.reply_text(
-            f"⏳ Please wait `{remaining}s` before sending another link.",
-            parse_mode=ParseMode.MARKDOWN,
+            f"```\n[RATE LIMIT]\nCooldown: {cd}s remaining\n```",
+            parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
 
-    record_rate_limit(user)
+    record_rl(user)
     stats["users"].add(user)
 
     if download_queue and download_queue.qsize() >= MAX_QUEUE_SIZE:
         await update.message.reply_text(
-            "⚠️ *Queue is full!* Please try again in a moment.",
-            parse_mode=ParseMode.MARKDOWN,
+            "```\n[QUEUE FULL]\nAll slots occupied. Retry shortly.\n```",
+            parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
 
-    msg       = await update.message.reply_text("🔍 _Fetching info…_", parse_mode=ParseMode.MARKDOWN)
+    msg       = await update.message.reply_text(
+        "```\n[INITIALIZING...]\n```", parse_mode=ParseMode.MARKDOWN_V2
+    )
     stop_anim = asyncio.Event()
     anim_task = asyncio.create_task(animated_fetch(msg, stop_anim))
 
@@ -512,23 +862,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timeout=60,
         )
     except asyncio.TimeoutError:
-        stop_anim.set()
-        await anim_task
-        await safe_edit(
-            msg,
-            "❌ *Timed out fetching video info.* The site may be slow or unreachable.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        stop_anim.set(); await anim_task
+        await safe_edit(msg, "```\n[TIMEOUT]\nTarget unreachable (>60s).\n```",
+                        parse_mode=ParseMode.MARKDOWN_V2)
         return
     except Exception as e:
-        logger.error("Info fetch error: %s", e)
-        stop_anim.set()
-        await anim_task
-        await safe_edit(msg, user_facing_error(e), parse_mode=ParseMode.MARKDOWN_V2)
+        logger.error("info fetch: %s", e)
+        stop_anim.set(); await anim_task
+        await safe_edit(msg, error_msg(e), parse_mode=ParseMode.MARKDOWN_V2)
         return
     else:
-        stop_anim.set()
-        await anim_task
+        stop_anim.set(); await anim_task
 
     await msg.delete()
 
@@ -538,358 +882,420 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await update.message.reply_photo(
-            photo=thumb,
-            caption=caption,
+            photo=thumb, caption=caption,
             reply_markup=InlineKeyboardMarkup(buttons),
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
         await update.message.reply_text(
-            caption,
-            reply_markup=InlineKeyboardMarkup(buttons),
+            caption, reply_markup=InlineKeyboardMarkup(buttons),
             parse_mode=ParseMode.MARKDOWN,
         )
 
-# ╔══════════════════════════════════════════╗
-#   BUTTON HANDLER
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  BUTTON HANDLER
+# ═══════════════════════════════════════════════════════════
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     if query.data == "cancel":
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
+        try: await query.message.delete()
+        except Exception: pass
         return
 
+    # "fetch|<url>" — from search/trending/playlist results
+    if query.data.startswith("fetch|"):
+        url = query.data[6:].replace("%7C", "|")
+        # Synthesise a fake Update.message to reuse handle_link logic
+        try: await query.message.delete()
+        except Exception: pass
+
+        stop = asyncio.Event()
+        msg  = await query.message.reply_text(
+            "```\n[SCANNING TARGET...]\n```", parse_mode=ParseMode.MARKDOWN_V2
+        )
+        anim = asyncio.create_task(animated_fetch(msg, stop))
+        try:
+            info = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, get_video_info, url),
+                timeout=60,
+            )
+        except Exception as e:
+            stop.set(); await anim
+            await safe_edit(msg, error_msg(e), parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        stop.set(); await anim
+        await msg.delete()
+        caption = build_caption(info)
+        buttons = build_buttons(info, url)
+        thumb   = info.get("thumbnail")
+        try:
+            await query.message.reply_photo(
+                photo=thumb, caption=caption,
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            await query.message.reply_text(
+                caption, reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        return
+
+    # Normal download selection
     parts = query.data.split("|", 2)
-    if len(parts) != 3 or parts[0] not in ("mp3", "mp4"):
-        await query.answer("⚠️ Invalid selection.", show_alert=True)
+    if len(parts) != 3 or parts[0] not in ("mp3", "mp4", "m4a", "ogg"):
+        await query.answer("⚠ Invalid selection.", show_alert=True)
         return
 
     typ, quality, safe_url = parts
-    url = safe_url.replace("%7C", "|")
-    pos = (download_queue.qsize() if download_queue else 0) + 1
+    url  = safe_url.replace("%7C", "|")
+    pos  = (download_queue.qsize() if download_queue else 0) + 1
 
     try:
         await query.edit_message_caption(
-            caption=f"✅ *Added to queue — position #{pos}*",
-            parse_mode=ParseMode.MARKDOWN,
+            caption=(
+                f"```\n[MISSION QUEUED #{pos}]\n"
+                f"format : {typ.upper()} / {quality}\n"
+                f"status : waiting for worker\n```"
+            ),
+            parse_mode=ParseMode.MARKDOWN_V2,
         )
     except BadRequest:
         try:
             await query.edit_message_text(
-                text=f"✅ *Added to queue — position #{pos}*",
-                parse_mode=ParseMode.MARKDOWN,
+                text=(
+                    f"```\n[MISSION QUEUED #{pos}]\n"
+                    f"format : {typ.upper()} / {quality}\n```"
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
             )
         except Exception as e:
-            logger.debug("Could not edit queued message: %s", e)
+            logger.debug("edit fail: %s", e)
 
-    label      = f"🎵 MP3 {quality}kbps" if typ == "mp3" else f"🎥 MP4 {quality}p"
     status_msg = await query.message.reply_text(
-        f"🕐 *Queued* — {label}\n_Waiting for a free worker…_",
-        parse_mode=ParseMode.MARKDOWN,
+        f"```\n"
+        f"[QUEUED — POSITION #{pos}]\n"
+        f"target : {typ.upper()} {quality}\n"
+        f"status : standby...\n"
+        f"```",
+        parse_mode=ParseMode.MARKDOWN_V2,
     )
-
     if download_queue:
         await download_queue.put((query, typ, quality, url, status_msg))
 
-# ╔══════════════════════════════════════════╗
-#   DOWNLOAD WORKER
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  WORKERS
+# ═══════════════════════════════════════════════════════════
 
-async def worker(worker_id: int):
-    logger.info("Worker %d started", worker_id)
+async def worker(wid: int):
+    logger.info("Worker %d online", wid)
     while True:
         try:
             query, typ, quality, url, msg = await download_queue.get()
-            active_downloads[worker_id]   = url
+            active_downloads[wid] = url
             try:
                 await asyncio.wait_for(
-                    process(query, typ, quality, url, msg, worker_id),
+                    process(query, typ, quality, url, msg, wid),
                     timeout=DOWNLOAD_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                logger.error("Worker %d timed out on %s", worker_id, url)
+                logger.error("Worker %d timeout on %s", wid, url)
                 stats["failed"] += 1
-                await safe_edit(msg, "❌ *Download timed out* — video may be too long.",
-                                parse_mode=ParseMode.MARKDOWN)
+                await safe_edit(msg,
+                    "```\n[TIMEOUT]\nMission exceeded time limit.\n```",
+                    parse_mode=ParseMode.MARKDOWN_V2)
         except asyncio.CancelledError:
-            logger.info("Worker %d shutting down.", worker_id)
-            break
+            logger.info("Worker %d terminating.", wid); break
         except Exception as e:
-            logger.exception("Worker %d crashed: %s", worker_id, e)
+            logger.exception("Worker %d crash: %s", wid, e)
         finally:
-            active_downloads.pop(worker_id, None)
+            active_downloads.pop(wid, None)
             download_queue.task_done()
 
-# ╔══════════════════════════════════════════╗
-#   PROCESS / DOWNLOAD  (with client fallback)
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  PROCESS  —  full download pipeline with fallback
+# ═══════════════════════════════════════════════════════════
 
-async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
+async def process(query, typ: str, quality: str, url: str, msg, wid: int):
     loop = asyncio.get_event_loop()
+    uid  = query.from_user.id if query.from_user else 0
 
-    # ── Cache check ──────────────────────────────────────────────
-    ck         = cache_key(url, typ, quality)
-    cache_path = CACHE_FOLDER / ck
-
-    if cache_path.exists():
-        await safe_edit(msg, "⚡ *Sending from cache…*", parse_mode=ParseMode.MARKDOWN)
+    # ── Cache check ──────────────────────────────────────
+    cp = CACHE_FOLDER / ckey(url, typ, quality)
+    if cp.exists():
+        await safe_edit(msg,
+            "```\n[CACHE HIT]\nTransmitting from local cache...\n```",
+            parse_mode=ParseMode.MARKDOWN_V2)
         try:
-            caption = f"✅ {'🎵 Audio' if typ == 'mp3' else '🎥 Video'} _(cached)_"
-            with open(cache_path, "rb") as f:
-                if typ == "mp3":
-                    await msg.reply_audio(f, caption=caption, parse_mode=ParseMode.MARKDOWN,
+            cap = f"`{'🎵 AUDIO' if typ == 'mp3' else '🎥 VIDEO'}` _(cached)_"
+            with open(cp, "rb") as f:
+                if typ in ("mp3", "m4a", "ogg"):
+                    await msg.reply_audio(f, caption=cap, parse_mode=ParseMode.MARKDOWN,
                                           read_timeout=120, write_timeout=120)
                 else:
-                    await msg.reply_video(f, caption=caption, parse_mode=ParseMode.MARKDOWN,
+                    await msg.reply_video(f, caption=cap, parse_mode=ParseMode.MARKDOWN,
                                           supports_streaming=True,
                                           read_timeout=120, write_timeout=120)
             await msg.delete()
             stats["downloads"] += 1
             return
         except Exception as e:
-            logger.error("Cache send failed (%s) — re-downloading.", e)
-            cache_path.unlink(missing_ok=True)
+            logger.error("cache send fail: %s", e)
+            cp.unlink(missing_ok=True)
 
-    # ── Fetch clean title ─────────────────────────────────────────
+    # ── Title fetch ───────────────────────────────────────
     try:
         info        = await loop.run_in_executor(None, get_video_info, url)
-        clean_title = sanitize_title(info.get("title") or "download")
+        clean_title = sanitize(info.get("title") or "download")
     except Exception:
         clean_title = "download"
 
-    # ── Build yt-dlp format string ────────────────────────────────
+    # ── Format string ─────────────────────────────────────
     if typ == "mp3":
+        fmt = "bestaudio[ext=webm]/bestaudio/best"
+    elif typ in ("m4a", "ogg"):
         fmt = "bestaudio/best"
     elif quality == "best":
         fmt = "bestvideo+bestaudio/best"
     else:
+        q = int(quality)
         fmt = (
-            f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]"
-            f"/bestvideo[height<={quality}]+bestaudio"
-            f"/best[height<={quality}]/best"
+            f"bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]"
+            f"/bestvideo[height<={q}]+bestaudio"
+            f"/best[height<={q}]/best"
         )
 
-    output_template = str(DOWNLOAD_FOLDER / f"{clean_title}.%(ext)s")
+    out_tpl  = str(DOWNLOAD_FOLDER / f"{clean_title}.%(ext)s")
+    frame_n  = {"n": 0, "last_pct": -1.0, "phase_idx": 0}
 
-    # ── Progress hook ─────────────────────────────────────────────
-    frame_counter = {"n": 0, "last_pct": -1.0}
-
-    def hook(d: dict) -> None:
-        if d["status"] != "downloading":
-            return
+    # ── Progress hook ─────────────────────────────────────
+    def hook(d: dict):
+        if d["status"] != "downloading": return
         raw = d.get("_percent_str", "0").strip().replace("%", "")
-        try:
-            pct = float(raw)
-        except ValueError:
-            return
-        if pct - frame_counter["last_pct"] < 3 and pct < 99:
-            return
-        frame_counter["last_pct"] = pct
-        frame_counter["n"]       += 1
+        try: pct = float(raw)
+        except ValueError: return
+        if pct - frame_n["last_pct"] < 2.5 and pct < 99: return
+        frame_n["last_pct"] = pct
+        frame_n["n"]       += 1
 
-        bar      = rich_progress_bar(pct)
-        wave     = mini_wave(frame_counter["n"], width=6)
-        speed    = (d.get("_speed_str")   or "—").strip()
-        eta      = (d.get("_eta_str")     or "—").strip()
-        size_str = (d.get("_total_bytes_str") or
-                    d.get("_total_bytes_estimate_str") or "—").strip()
-        phase    = "🎵 Audio" if typ == "mp3" else "🎥 Video"
+        bar     = _hbar(pct)
+        phase   = _phase(pct)
+        speed   = (d.get("_speed_str")   or "—").strip()
+        eta     = (d.get("_eta_str")     or "—").strip()
+        size    = (d.get("_total_bytes_str") or
+                   d.get("_total_bytes_estimate_str") or "—").strip()
+        radar   = _RADAR[frame_n["n"] % len(_RADAR)]
+        glbl    = _glitch(phase, frame_n["n"])
 
         text = (
-            f"{phase} — *{quality}{'kbps' if typ == 'mp3' else 'p'}*\n\n"
-            f"`{bar}` *{pct:.0f}%*\n\n"
-            f"{wave}\n\n"
-            f"📦 `{size_str}`   ⚡ `{speed}`   ⏱ `{eta}`"
+            f"```\n"
+            f"[{radar}] NEXUS-DL // EXTRACTION\n"
+            f"{'─'*30}\n"
+            f"TARGET : {typ.upper()} {quality}{'kbps' if typ=='mp3' else 'p' if quality.isdigit() else ''}\n"
+            f"PHASE  : {glbl}\n"
+            f"[{bar}] {pct:.0f}%\n"
+            f"SIZE   : {size}\n"
+            f"SPEED  : {speed}\n"
+            f"ETA    : {eta}\n"
+            f"```"
         )
         loop.call_soon_threadsafe(
             asyncio.ensure_future,
-            safe_edit(msg, text, parse_mode=ParseMode.MARKDOWN),
+            safe_edit(msg, text, parse_mode=ParseMode.MARKDOWN_V2),
         )
 
-    # ── Build base ydl opts ───────────────────────────────────────
-    base_ydl_opts = {
+    # ── Build opts ────────────────────────────────────────
+    ydl_opts = {
         **build_ydl_common(),
         "format":         fmt,
-        "outtmpl":        output_template,
+        "outtmpl":        out_tpl,
         "progress_hooks": [hook],
     }
     if typ == "mp4":
-        base_ydl_opts["merge_output_format"] = "mp4"
+        ydl_opts["merge_output_format"] = "mp4"
     if typ == "mp3":
-        base_ydl_opts["postprocessors"] = [{
-            "key":              "FFmpegExtractAudio",
-            "preferredcodec":   "mp3",
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
             "preferredquality": quality,
         }]
+    elif typ == "m4a":
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "m4a",
+            "preferredquality": "0",
+        }]
+    elif typ == "ogg":
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "vorbis",
+            "preferredquality": "5",
+        }]
 
-    await safe_edit(msg, "⬇️ _Starting download…_", parse_mode=ParseMode.MARKDOWN)
+    await safe_edit(msg,
+        f"```\n[DOWNLOAD INITIATED]\ntarget : {typ.upper()} {quality}\nstatus : connecting...\n```",
+        parse_mode=ParseMode.MARKDOWN_V2)
 
-    # ── Download with automatic client fallback ───────────────────
-    file_path  = None
-    last_error = None
+    # ── Download with fallback ────────────────────────────
+    fp_str = None; last_err = None
 
     try:
-        file_path = await loop.run_in_executor(
-            None, lambda: _run_ydl(base_ydl_opts, url, typ, clean_title)
+        fp_str = await loop.run_in_executor(
+            None, lambda: _run_ydl(ydl_opts, url, typ, clean_title)
         )
     except Exception as e:
-        last_error = e
-        if not _is_bot_detection_error(e):
+        last_err = e
+        if not _is_bot_block(e):
             stats["failed"] += 1
-            await safe_edit(msg, user_facing_error(e), parse_mode=ParseMode.MARKDOWN_V2)
+            await safe_edit(msg, error_msg(e), parse_mode=ParseMode.MARKDOWN_V2)
             return
-        logger.warning("Primary download blocked (%s) — trying fallbacks…", e)
+        logger.warning("Primary download blocked — trying fallbacks…")
 
-    if file_path is None and last_error is not None:
-        for i, fb_args in enumerate(_FALLBACK_CLIENTS):
-            client_name = fb_args["youtube"]["player_client"][0]
-            await safe_edit(
-                msg,
-                f"🔄 _Retrying with `{client_name}` client "
-                f"({i + 1}/{len(_FALLBACK_CLIENTS)})…_",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+    if fp_str is None and last_err is not None:
+        for i, fb in enumerate(_FALLBACK_CLIENTS):
+            cname = fb["youtube"]["player_client"][0]
+            await safe_edit(msg,
+                f"```\n[BYPASS #{i+1}/{len(_FALLBACK_CLIENTS)}]\nclient: {cname}\nretrying...\n```",
+                parse_mode=ParseMode.MARKDOWN_V2)
             try:
-                fb_opts   = {**base_ydl_opts, "extractor_args": fb_args}
-                file_path = await loop.run_in_executor(
+                fb_opts = {**ydl_opts, "extractor_args": fb}
+                fp_str  = await loop.run_in_executor(
                     None, lambda o=fb_opts: _run_ydl(o, url, typ, clean_title)
                 )
-                if file_path:
-                    logger.info("Fallback `%s` succeeded.", client_name)
-                    last_error = None
-                    break
+                if fp_str:
+                    logger.info("Fallback `%s` succeeded.", cname)
+                    last_err = None; break
             except Exception as fe:
-                last_error = fe
-                logger.debug("Fallback `%s` failed: %s", client_name, fe)
+                last_err = fe
+                logger.debug("Fallback `%s` fail: %s", cname, fe)
 
-    if last_error and not file_path:
+    if last_err and not fp_str:
         stats["failed"] += 1
-        await safe_edit(msg, user_facing_error(last_error), parse_mode=ParseMode.MARKDOWN_V2)
+        await safe_edit(msg, error_msg(last_err), parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    if not file_path or not Path(file_path).exists():
+    if not fp_str or not Path(fp_str).exists():
         stats["failed"] += 1
-        await safe_edit(
-            msg,
-            "❌ *File not found after download.*\n"
-            "The video may be geo-restricted or too long.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await safe_edit(msg,
+            "```\n[FILE NOT FOUND]\nDownload completed but output missing.\nTry shorter video or different format.\n```",
+            parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    fp        = Path(file_path)
-    file_size = fp.stat().st_size
+    fp   = Path(fp_str)
+    fsz  = fp.stat().st_size
 
-    if file_size > MAX_FILE_SIZE:
+    if fsz > MAX_FILE_SIZE:
         fp.unlink(missing_ok=True)
         stats["failed"] += 1
-        await safe_edit(
-            msg,
-            f"⚠️ *File too large for Telegram*\n\n"
-            f"Size : `{fmt_size(file_size)}`\n"
-            f"Limit: `{fmt_size(MAX_FILE_SIZE)}`\n\n"
-            "Try:\n• MP3 instead of MP4\n• Lower resolution\n• Shorter video",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await safe_edit(msg,
+            f"```\n[SIZE EXCEEDED]\nfile  : {fmt_size(fsz)}\nlimit : {fmt_size(MAX_FILE_SIZE)}\n"
+            f"fix   : use lower res or mp3\n```",
+            parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    await safe_edit(
-        msg,
-        f"📤 *Uploading* `{fp.name}` — `{fmt_size(file_size)}`…",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await safe_edit(msg,
+        f"```\n[TRANSMITTING]\nfile  : {fp.name[:40]}\nsize  : {fmt_size(fsz)}\nuplink: active...\n```",
+        parse_mode=ParseMode.MARKDOWN_V2)
 
-    # Cache BEFORE sending (and before finally-delete)
-    try:
-        shutil.copy2(fp, cache_path)
-    except Exception as ce:
-        logger.warning("Cache write failed: %s", ce)
+    # Cache before send
+    try: shutil.copy2(fp, cp)
+    except Exception as ce: logger.warning("cache write: %s", ce)
 
     try:
         with open(fp, "rb") as f:
-            caption = f"✅ *{fp.stem}*"
-            if typ == "mp3":
-                await msg.reply_audio(audio=f, caption=caption, title=fp.stem,
+            cap = f"✅ `{fp.stem[:50]}`"
+            if typ in ("mp3", "m4a", "ogg"):
+                await msg.reply_audio(audio=f, caption=cap, title=fp.stem,
                                       parse_mode=ParseMode.MARKDOWN,
                                       read_timeout=180, write_timeout=180)
             else:
-                await msg.reply_video(video=f, caption=caption,
+                await msg.reply_video(video=f, caption=cap,
                                       parse_mode=ParseMode.MARKDOWN,
                                       supports_streaming=True,
                                       read_timeout=180, write_timeout=180)
         await msg.delete()
         stats["downloads"] += 1
+        stats["bytes_sent"] += fsz
+        push_history(uid, clean_title, typ, quality)
 
     except Exception as e:
-        logger.error("Upload error: %s", e)
+        logger.error("upload fail: %s", e)
         stats["failed"] += 1
-        cache_path.unlink(missing_ok=True)
-        await safe_edit(msg, f"❌ *Upload failed*\n\n`{str(e)[:200]}`",
-                        parse_mode=ParseMode.MARKDOWN)
+        cp.unlink(missing_ok=True)
+        await safe_edit(msg, f"```\n[UPLOAD FAILED]\n{mdescape(str(e)[:200])}\n```",
+                        parse_mode=ParseMode.MARKDOWN_V2)
     finally:
         fp.unlink(missing_ok=True)
 
-# ╔══════════════════════════════════════════╗
-#   BLOCKING YT-DLP CALL  (runs in executor)
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  YT-DLP RUNNER  (blocking, runs in executor)
+# ═══════════════════════════════════════════════════════════
 
 def _run_ydl(opts: dict, url: str, typ: str, clean_title: str) -> str | None:
     with yt_dlp.YoutubeDL(opts) as ydl:
         info     = ydl.extract_info(url, download=True)
         raw_path = ydl.prepare_filename(info)
 
-    if typ == "mp3":
-        mp3_path = Path(raw_path).with_suffix(".mp3")
-        if mp3_path.exists():
-            return str(mp3_path)
+    ext_map = {"mp3": ".mp3", "m4a": ".m4a", "ogg": ".ogg"}
+    if typ in ext_map:
+        direct = Path(raw_path).with_suffix(ext_map[typ])
+        if direct.exists(): return str(direct)
         candidates = sorted(
-            (f for f in DOWNLOAD_FOLDER.iterdir() if f.suffix == ".mp3"),
+            (f for f in DOWNLOAD_FOLDER.iterdir() if f.suffix == ext_map[typ]),
             key=lambda p: p.stat().st_mtime, reverse=True,
         )
         return str(candidates[0]) if candidates else None
 
     final = Path(raw_path)
-    if final.exists():
-        return str(final)
-
+    if final.exists(): return str(final)
     for ext in (".mp4", ".mkv", ".webm"):
         candidates = sorted(
             (f for f in DOWNLOAD_FOLDER.iterdir() if f.suffix == ext),
             key=lambda p: p.stat().st_mtime, reverse=True,
         )
-        if candidates:
-            return str(candidates[0])
+        if candidates: return str(candidates[0])
     return None
 
-# ╔══════════════════════════════════════════╗
-#   GLOBAL ERROR HANDLER
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  ERROR HANDLER
+# ═══════════════════════════════════════════════════════════
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled exception", exc_info=context.error)
 
-# ╔══════════════════════════════════════════╗
-#   APP SETUP
-# ╚══════════════════════════════════════════╝
+# ═══════════════════════════════════════════════════════════
+#  APP SETUP
+# ═══════════════════════════════════════════════════════════
 
 async def post_init(app):
     global download_queue
     download_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
     for i in range(WORKERS):
         asyncio.create_task(worker(i + 1))
+    # Register bot commands for the menu button
+    await app.bot.set_my_commands([
+        BotCommand("start",    "Boot sequence"),
+        BotCommand("search",   "Search YouTube"),
+        BotCommand("trending", "YouTube trending"),
+        BotCommand("playlist", "Extract playlist"),
+        BotCommand("info",     "Inspect a URL"),
+        BotCommand("history",  "Your download log"),
+        BotCommand("queue",    "Mission queue status"),
+        BotCommand("stats",    "System telemetry"),
+        BotCommand("ping",     "Latency check"),
+        BotCommand("help",     "Operator manual"),
+    ])
     po, _ = get_po_token()
     logger.info(
-        "%d workers started | mode=%s | PO token=%s | cookies=%s",
+        "NEXUS-DL online | workers=%d | mode=%s | po_token=%s | cookies=%s | proxy=%s",
         WORKERS,
         "webhook" if WEBHOOK_URL else "polling",
         "yes" if po else "no",
         "yes" if COOKIES_FILE.exists() else "no",
+        "yes" if HTTP_PROXY else "no",
     )
 
 def main():
@@ -908,24 +1314,28 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help",  cmd_help))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("help",     cmd_help))
+    app.add_handler(CommandHandler("stats",    cmd_stats))
+    app.add_handler(CommandHandler("queue",    cmd_queue))
+    app.add_handler(CommandHandler("ping",     cmd_ping))
+    app.add_handler(CommandHandler("history",  cmd_history))
+    app.add_handler(CommandHandler("info",     cmd_info))
+    app.add_handler(CommandHandler("search",   cmd_search))
+    app.add_handler(CommandHandler("trending", cmd_trending))
+    app.add_handler(CommandHandler("playlist", cmd_playlist))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_error_handler(error_handler)
 
     if WEBHOOK_URL:
-        logger.info("Starting WEBHOOK mode on port %d", PORT)
+        logger.info("WEBHOOK mode — port %d", PORT)
         app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=WEBHOOK_URL,
-            drop_pending_updates=True,
+            listen="0.0.0.0", port=PORT,
+            webhook_url=WEBHOOK_URL, drop_pending_updates=True,
         )
     else:
-        logger.info("Starting POLLING mode")
+        logger.info("POLLING mode")
         app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
