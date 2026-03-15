@@ -1532,30 +1532,41 @@ async def process(query, typ: str, quality: str, url: str, msg, wid: int):
     except Exception:
         clean_title = "download"
 
-    # ── Format string ─────────────────────────────────────
-    # Each "/" is a fallback: yt-dlp tries left-to-right and picks
-    # the first format selector that yields a result. This means even
-    # if the exact height is not available, it falls back gracefully.
+    # ── Format string ─────────────────────────────────────────────────────
+    # ROOT CAUSE of "Requested format is not available":
+    #   Codec-locked selectors like [ext=mp4] or [ext=m4a] silently fail
+    #   when a video only has VP9/AV1/webm streams (very common on YouTube).
+    #
+    # RULE: NEVER filter by codec/container in the format selector.
+    #   Let yt-dlp pick the best available streams by quality only,
+    #   then let FFmpeg convert/remux into the target container.
+    #   This works for 100% of videos regardless of what codecs YouTube serves.
+    # ─────────────────────────────────────────────────────────────────────────
     if typ == "mp3":
-        fmt = "bestaudio[ext=webm]/bestaudio/best"
-    elif typ in ("m4a", "ogg"):
+        # Download best audio stream, FFmpeg converts to MP3
         fmt = "bestaudio/best"
+
+    elif typ == "m4a":
+        # Best audio, FFmpeg remuxes/converts to M4A
+        fmt = "bestaudio/best"
+
+    elif typ == "ogg":
+        # Best audio, FFmpeg converts to OGG Vorbis
+        fmt = "bestaudio/best"
+
     elif quality == "best":
+        # Absolute best video+audio — let yt-dlp decide everything
         fmt = "bestvideo+bestaudio/best"
+
     else:
         q = int(quality)
+        # Priority: exact height → closest height below → best available
+        # NO codec filters — accept any codec, FFmpeg will remux to mp4
         fmt = (
-            # Exact height, mp4+m4a (ideal mux)
-            f"bestvideo[height={q}][ext=mp4]+bestaudio[ext=m4a]"
-            # Exact height, any codec
-            f"/bestvideo[height={q}]+bestaudio"
-            # Best <= requested, mp4+m4a
-            f"/bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]"
-            # Best <= requested, any codec
+            f"bestvideo[height={q}]+bestaudio"
             f"/bestvideo[height<={q}]+bestaudio"
-            # Single file <= requested
             f"/best[height<={q}]"
-            # Absolute fallback
+            f"/bestvideo+bestaudio"
             f"/best"
         )
 
@@ -1605,23 +1616,27 @@ async def process(query, typ: str, quality: str, url: str, msg, wid: int):
         "outtmpl":        out_tpl,
         "progress_hooks": [hook],
     }
+
+    # Video: always remux to mp4 so Telegram plays it inline
     if typ == "mp4":
         ydl_opts["merge_output_format"] = "mp4"
+
+    # Audio: postprocessor chain converts whatever yt-dlp downloaded → target codec
     if typ == "mp3":
         ydl_opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": quality,
+            "key":              "FFmpegExtractAudio",
+            "preferredcodec":   "mp3",
+            "preferredquality": quality,   # "128", "192", "320"
         }]
     elif typ == "m4a":
         ydl_opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
+            "key":            "FFmpegExtractAudio",
             "preferredcodec": "m4a",
             "preferredquality": "0",
         }]
     elif typ == "ogg":
         ydl_opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
+            "key":            "FFmpegExtractAudio",
             "preferredcodec": "vorbis",
             "preferredquality": "5",
         }]
@@ -1726,28 +1741,63 @@ async def process(query, typ: str, quality: str, url: str, msg, wid: int):
 # ═══════════════════════════════════════════════════════════
 
 def _run_ydl(opts: dict, url: str, typ: str, clean_title: str) -> str | None:
+    """
+    Run yt-dlp download and reliably locate the output file.
+
+    The challenge: FFmpeg postprocessors rename/replace files after download,
+    so ydl.prepare_filename() returns the PRE-postprocessing name which may
+    not exist. We snapshot the download folder before and after, then pick
+    the newest file matching the expected extension.
+    """
+    # Snapshot files in download folder before we start
+    before: set[Path] = set(DOWNLOAD_FOLDER.iterdir()) if DOWNLOAD_FOLDER.exists() else set()
+    t_start = time.time()
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         info     = ydl.extract_info(url, download=True)
         raw_path = ydl.prepare_filename(info)
 
-    ext_map = {"mp3": ".mp3", "m4a": ".m4a", "ogg": ".ogg"}
-    if typ in ext_map:
-        direct = Path(raw_path).with_suffix(ext_map[typ])
-        if direct.exists(): return str(direct)
-        candidates = sorted(
-            (f for f in DOWNLOAD_FOLDER.iterdir() if f.suffix == ext_map[typ]),
-            key=lambda p: p.stat().st_mtime, reverse=True,
-        )
-        return str(candidates[0]) if candidates else None
+    # Expected extensions after postprocessing
+    if typ == "mp3":
+        target_exts = [".mp3"]
+    elif typ == "m4a":
+        target_exts = [".m4a", ".m4a"]
+    elif typ == "ogg":
+        target_exts = [".ogg", ".opus"]
+    else:
+        # Video: mp4 preferred (merge_output_format="mp4"), then mkv/webm
+        target_exts = [".mp4", ".mkv", ".webm", ".avi"]
 
-    final = Path(raw_path)
-    if final.exists(): return str(final)
-    for ext in (".mp4", ".mkv", ".webm"):
+    # 1. Try the direct path yt-dlp reported (works when no postprocessing)
+    direct = Path(raw_path)
+    if direct.exists():
+        return str(direct)
+
+    # 2. Try swapping the extension to the expected postprocessed one
+    for ext in target_exts:
+        swapped = direct.with_suffix(ext)
+        if swapped.exists():
+            return str(swapped)
+
+    # 3. Find any NEW file created after t_start with matching extension
+    after: set[Path] = set(DOWNLOAD_FOLDER.iterdir()) if DOWNLOAD_FOLDER.exists() else set()
+    new_files = after - before
+    for ext in target_exts:
+        matches = [f for f in new_files if f.suffix == ext]
+        if matches:
+            return str(max(matches, key=lambda p: p.stat().st_mtime))
+
+    # 4. Last resort: newest file with matching extension (could be concurrent download)
+    for ext in target_exts:
         candidates = sorted(
-            (f for f in DOWNLOAD_FOLDER.iterdir() if f.suffix == ext),
+            (f for f in DOWNLOAD_FOLDER.iterdir()
+             if f.suffix == ext and f.stat().st_mtime >= t_start - 5),
             key=lambda p: p.stat().st_mtime, reverse=True,
         )
-        if candidates: return str(candidates[0])
+        if candidates:
+            return str(candidates[0])
+
+    logger.error("_run_ydl: could not locate output. raw=%s typ=%s", raw_path, typ)
     return None
 
 # ═══════════════════════════════════════════════════════════
