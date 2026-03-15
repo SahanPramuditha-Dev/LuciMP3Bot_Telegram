@@ -402,51 +402,77 @@ def build_caption(info: dict) -> str:
     )
 
 def build_buttons(info: dict, url: str) -> list:
+    """
+    Build format selection buttons.
+
+    WHY we don't rely purely on format detection:
+      tv_embedded / ios clients return incomplete format lists during info-fetch
+      (adaptive video-only streams are often missing or have null heights).
+      yt-dlp handles missing resolutions gracefully at download time via the
+      fallback chain in the format string (best[height<=N]/best), so it's safe
+      to always offer all standard buttons — the download will just pick the
+      closest available quality.
+
+    Strategy:
+      1. Collect heights actually present in the format list.
+      2. For each standard tier, show the button if EITHER:
+         a) an exact or near-exact format exists, OR
+         b) the video's max height is >= that tier (so yt-dlp can downscale).
+      3. Always show every tier ≤ max_height so the user always has choices.
+    """
     formats  = info.get("formats", [])
     safe_url = url.replace("|", "%7C")
 
-    # Detect available heights from formats
-    available = set()
+    # Collect all heights reported by yt-dlp
+    raw_heights: set[int] = set()
     for f in formats:
         h = f.get("height")
-        if h and isinstance(h, int):
-            # Round to nearest standard height
-            for std in _ALL_HEIGHTS:
-                if abs(h - std) <= 20:
-                    available.add(std)
-                    break
+        if h and isinstance(h, int) and h > 0:
+            raw_heights.add(h)
 
-    # Always offer at least 360p as fallback
-    if not available:
-        available.add(360)
+    # Best guess at the video's maximum resolution
+    max_height = max(raw_heights) if raw_heights else 1080
+
+    # Determine which standard tiers to show:
+    # Show a tier if the video has at least that resolution.
+    # Always include 360p as a baseline even for very low-res content.
+    available: set[int] = {360}
+    for std in _ALL_HEIGHTS:
+        if max_height >= std:
+            available.add(std)
+        # Also catch formats that are within ±30px of a standard tier
+        for h in raw_heights:
+            if abs(h - std) <= 30:
+                available.add(std)
 
     heights = sorted(available)
-    rows    = []
+    rows: list = []
 
-    # Video buttons — 2 per row
-    vid_row = []
+    # ── Video resolution buttons — 2 per row ─────────────────────
+    vid_row: list = []
     for h in heights:
-        lbl = f"{_RES_ICONS.get(h,'📹')} {_RES_LABELS.get(h, f'{h}p')}"
+        lbl = f"{_RES_ICONS.get(h, '📹')} {_RES_LABELS.get(h, f'{h}p')}"
         vid_row.append(InlineKeyboardButton(lbl, callback_data=f"mp4|{h}|{safe_url}"))
         if len(vid_row) == 2:
-            rows.append(vid_row); vid_row = []
+            rows.append(vid_row)
+            vid_row = []
     if vid_row:
         rows.append(vid_row)
 
-    # Best-quality shortcut
+    # ── Best quality shortcut ─────────────────────────────────────
     rows.append([
         InlineKeyboardButton("🏆 Best Video+Audio", callback_data=f"mp4|best|{safe_url}")
     ])
 
-    # Audio buttons
+    # ── Audio buttons ─────────────────────────────────────────────
     rows.append([
         InlineKeyboardButton("🎵 MP3 128k", callback_data=f"mp3|128|{safe_url}"),
         InlineKeyboardButton("🎵 MP3 192k", callback_data=f"mp3|192|{safe_url}"),
         InlineKeyboardButton("🎵 MP3 320k", callback_data=f"mp3|320|{safe_url}"),
     ])
     rows.append([
-        InlineKeyboardButton("🎶 M4A Best",  callback_data=f"m4a|best|{safe_url}"),
-        InlineKeyboardButton("🎙 OGG Best",  callback_data=f"ogg|best|{safe_url}"),
+        InlineKeyboardButton("🎶 M4A Best", callback_data=f"m4a|best|{safe_url}"),
+        InlineKeyboardButton("🎙 OGG Best", callback_data=f"ogg|best|{safe_url}"),
     ])
     rows.append([InlineKeyboardButton("✖ ABORT", callback_data="cancel")])
     return rows
@@ -1054,6 +1080,9 @@ async def process(query, typ: str, quality: str, url: str, msg, wid: int):
         clean_title = "download"
 
     # ── Format string ─────────────────────────────────────
+    # Each "/" is a fallback: yt-dlp tries left-to-right and picks
+    # the first format selector that yields a result. This means even
+    # if the exact height is not available, it falls back gracefully.
     if typ == "mp3":
         fmt = "bestaudio[ext=webm]/bestaudio/best"
     elif typ in ("m4a", "ogg"):
@@ -1063,9 +1092,18 @@ async def process(query, typ: str, quality: str, url: str, msg, wid: int):
     else:
         q = int(quality)
         fmt = (
-            f"bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]"
+            # Exact height, mp4+m4a (ideal mux)
+            f"bestvideo[height={q}][ext=mp4]+bestaudio[ext=m4a]"
+            # Exact height, any codec
+            f"/bestvideo[height={q}]+bestaudio"
+            # Best <= requested, mp4+m4a
+            f"/bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]"
+            # Best <= requested, any codec
             f"/bestvideo[height<={q}]+bestaudio"
-            f"/best[height<={q}]/best"
+            # Single file <= requested
+            f"/best[height<={q}]"
+            # Absolute fallback
+            f"/best"
         )
 
     out_tpl  = str(DOWNLOAD_FOLDER / f"{clean_title}.%(ext)s")
