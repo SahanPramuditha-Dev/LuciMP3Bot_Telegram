@@ -403,55 +403,32 @@ def build_caption(info: dict) -> str:
 
 def build_buttons(info: dict, url: str) -> list:
     """
-    Build format selection buttons.
+    Always show ALL standard resolution tiers — no format-list detection.
 
-    WHY we don't rely purely on format detection:
-      tv_embedded / ios clients return incomplete format lists during info-fetch
-      (adaptive video-only streams are often missing or have null heights).
-      yt-dlp handles missing resolutions gracefully at download time via the
-      fallback chain in the format string (best[height<=N]/best), so it's safe
-      to always offer all standard buttons — the download will just pick the
-      closest available quality.
+    Root cause of the detection approach failing:
+      tv_embedded / ios / android clients used for bot-bypass return sparse or
+      completely empty format lists during info-fetch (heights are null or missing).
+      Any logic that tries to infer max_height from those lists will silently
+      cap buttons at whatever low-res formats happen to be reported.
 
-    Strategy:
-      1. Collect heights actually present in the format list.
-      2. For each standard tier, show the button if EITHER:
-         a) an exact or near-exact format exists, OR
-         b) the video's max height is >= that tier (so yt-dlp can downscale).
-      3. Always show every tier ≤ max_height so the user always has choices.
+    Correct approach:
+      Show every tier unconditionally. yt-dlp's format fallback chain
+        bestvideo[height=N] / bestvideo[height<=N] / best
+      handles unavailable resolutions gracefully at download time — if the
+      video is only 720p and the user picks 4K, they just get 720p.
+      No harm done, and the user always sees the full menu.
     """
-    formats  = info.get("formats", [])
     safe_url = url.replace("|", "%7C")
-
-    # Collect all heights reported by yt-dlp
-    raw_heights: set[int] = set()
-    for f in formats:
-        h = f.get("height")
-        if h and isinstance(h, int) and h > 0:
-            raw_heights.add(h)
-
-    # Best guess at the video's maximum resolution
-    max_height = max(raw_heights) if raw_heights else 1080
-
-    # Determine which standard tiers to show:
-    # Show a tier if the video has at least that resolution.
-    # Always include 360p as a baseline even for very low-res content.
-    available: set[int] = {360}
-    for std in _ALL_HEIGHTS:
-        if max_height >= std:
-            available.add(std)
-        # Also catch formats that are within ±30px of a standard tier
-        for h in raw_heights:
-            if abs(h - std) <= 30:
-                available.add(std)
-
-    heights = sorted(available)
     rows: list = []
 
-    # ── Video resolution buttons — 2 per row ─────────────────────
+    # ── All 8 video tiers, 2 per row ──────────────────────────────
+    # Layout:  [144p]  [240p]
+    #          [360p]  [480p]
+    #          [720p HD]  [1080p FHD]
+    #          [1440p QHD]  [2160p 4K]
     vid_row: list = []
-    for h in heights:
-        lbl = f"{_RES_ICONS.get(h, '📹')} {_RES_LABELS.get(h, f'{h}p')}"
+    for h in _ALL_HEIGHTS:
+        lbl = f"{_RES_ICONS[h]} {_RES_LABELS[h]}"
         vid_row.append(InlineKeyboardButton(lbl, callback_data=f"mp4|{h}|{safe_url}"))
         if len(vid_row) == 2:
             rows.append(vid_row)
@@ -459,12 +436,12 @@ def build_buttons(info: dict, url: str) -> list:
     if vid_row:
         rows.append(vid_row)
 
-    # ── Best quality shortcut ─────────────────────────────────────
+    # ── Best-quality shortcut (let yt-dlp decide) ─────────────────
     rows.append([
         InlineKeyboardButton("🏆 Best Video+Audio", callback_data=f"mp4|best|{safe_url}")
     ])
 
-    # ── Audio buttons ─────────────────────────────────────────────
+    # ── Audio formats ─────────────────────────────────────────────
     rows.append([
         InlineKeyboardButton("🎵 MP3 128k", callback_data=f"mp3|128|{safe_url}"),
         InlineKeyboardButton("🎵 MP3 192k", callback_data=f"mp3|192|{safe_url}"),
