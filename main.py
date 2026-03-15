@@ -57,11 +57,6 @@ logger = logging.getLogger(__name__)
 # ╚══════════════════════════════════════════╝
 
 def get_po_token() -> tuple[str | None, str | None]:
-    """
-    Generate a YouTube PO token using the npm package
-    youtube-po-token-generator (installed in Dockerfile).
-    Returns (po_token, visitor_data) or (None, None) on failure.
-    """
     try:
         result = subprocess.run(
             ["youtube-po-token-generator"],
@@ -94,13 +89,15 @@ PO_TOKEN, VISITOR_DATA = get_po_token()
 # ╚══════════════════════════════════════════╝
 
 def build_extractor_args() -> dict:
-    """Build extractor_args based on available PO token."""
+    """
+    Always keep android as fallback so all formats are available.
+    Apply PO token on top without removing android client.
+    """
     args = {"player_client": ["web", "android"]}
     if PO_TOKEN:
-        args["player_client"] = ["web"]
-        args["po_token"]      = [f"web+{PO_TOKEN}"]
+        args["po_token"] = [f"web+{PO_TOKEN}"]
     if VISITOR_DATA:
-        args["visitor_data"]  = [VISITOR_DATA]
+        args["visitor_data"] = [VISITOR_DATA]
     return {"youtube": args}
 
 YDL_COMMON: dict = {
@@ -216,11 +213,13 @@ def error_hint(e: Exception) -> str:
     msg = str(e)
     if "Sign in" in msg or "bot" in msg.lower():
         if PO_TOKEN:
-            return "\n\n💡 _PO token is active but YouTube still blocked — try adding `cookies.txt`_"
-        return "\n\n💡 _YouTube bot detection triggered — PO token not available on this server_"
+            return "\n\n💡 _PO token active but YouTube still blocked — try adding `cookies.txt`_"
+        return "\n\n💡 _YouTube bot detection triggered — PO token not available_"
     if "403" in msg:
         return "\n\n💡 _HTTP 403 — server IP may be blocked by YouTube_"
-    if "Private" in msg or "private" in msg:
+    if "not available" in msg.lower():
+        return "\n\n💡 _Format not available — try a different resolution_"
+    if "private" in msg.lower():
         return "\n\n💡 _This video is private or age-restricted_"
     return ""
 
