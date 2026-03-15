@@ -1,7 +1,7 @@
 """
 ╔═══════════════════════════════════════════════════════════╗
-║          N E X U S - D L   //  MEDIA EXTRACTION BOT      ║
-║          v3.0  |  by  0xNEXUS  |  classified: PUBLIC     ║
+║          N E X U S - D L   //  MEDIA EXTRACTION BOT       ║
+║          v3.0  |  by  0xNEXUS  |  classified: PUBLIC      ║
 ╚═══════════════════════════════════════════════════════════╝
 
   [BYPASS CHAIN]
@@ -117,7 +117,7 @@ def _generate_po_token() -> tuple[str | None, str | None]:
     try:
         r = subprocess.run(
             ["youtube-po-token-generator"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=8,  # was 30 — was blocking startup
         )
         if r.returncode != 0:
             logger.warning("PO token generator: exit %d — %s", r.returncode, r.stderr.strip())
@@ -128,6 +128,9 @@ def _generate_po_token() -> tuple[str | None, str | None]:
         if po:
             logger.info("▶ PO token acquired.")
         return po, vis
+    except subprocess.TimeoutExpired:
+        logger.info("PO token generator timed out — skipping.")
+        return None, None
     except FileNotFoundError:
         return None, None
     except Exception as e:
@@ -723,12 +726,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "AGENT"
     await update.message.reply_text(
         f"```\n"
-        f"╔══════════════════════════════════════╗\n"
-        f"║   N E X U S - D L  //  v3.0         ║\n"
-        f"║   MEDIA EXTRACTION SYSTEM ONLINE     ║\n"
-        f"╠══════════════════════════════════════╣\n"
+        f"╔═══════════════════════════════════════╗\n"
+        f"║   N E X U S - D L  //  v3.0           ║\n"
+        f"║   MEDIA EXTRACTION SYSTEM ONLINE      ║\n"
+        f"╠══════════════════════════════════════ ╣\n"
         f"║  AGENT AUTHENTICATED: {name[:14]:<14} ║\n"
-        f"╚══════════════════════════════════════╝\n"
+        f"╚═══════════════════════════════════════╝\n"
         f"```\n"
         f"*TARGET PLATFORMS:*\n"
         f"`YouTube` `TikTok` `Instagram` `Twitter/X`\n"
@@ -830,158 +833,135 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /auth — One-time Google OAuth2 setup that fixes IP blocking permanently.
-    Uses Google's TV device-auth flow directly (no yt-dlp wrapper).
-    After approval the token auto-refreshes forever.
-    """
-    uid = update.effective_user.id
+    """One-time Google OAuth2 setup. Fixes YouTube IP blocking permanently."""
+    uid  = update.effective_user.id
+    chat = update.effective_chat.id
+    bot  = context.bot   # capture bot object directly — safe to use from threads
 
     if ADMIN_IDS and uid not in ADMIN_IDS:
-        await update.message.reply_text(
-            "```\n[RESTRICTED]\nOnly admins can run /auth.\n```",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Only admins can run /auth.")
         return
 
     if oauth2_token_exists():
         await update.message.reply_text(
-            "```\n"
-            "[OAUTH2: ALREADY ACTIVE]\n"
-            "Google account is linked.\n"
-            "Downloads bypass IP blocks.\n"
-            "\n"
-            "To re-auth, delete token file:\n"
-            "  rm ~/.cache/yt-dlp/youtube-oauth2.token.json\n"
-            "  rm oauth2_token.json\n"
-            "Then run /auth again.\n"
-            "```",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            "✅ OAuth2 already active — Google account is linked.\n"
+            "All downloads bypass IP blocks.\n\n"
+            "To re-auth: delete oauth2_token.json and run /auth again."
         )
         return
 
+    # Clear stuck state older than 10 minutes
     if uid in _oauth_pending:
-        # Clear stuck state older than 10 minutes
-        entry = _oauth_pending[uid]
-        if isinstance(entry, dict) and time.time() - entry.get("ts", 0) > 600:
-            del _oauth_pending[uid]
-        elif isinstance(entry, bool):
-            del _oauth_pending[uid]
-        else:
+        if time.time() - _oauth_pending[uid].get("ts", 0) < 600:
             await update.message.reply_text(
-                "```\n[AUTH IN PROGRESS]\nAlready running. Check above for the code.\nIf stuck, wait 2 min and try again.\n```",
-                parse_mode=ParseMode.MARKDOWN_V2,
+                "⏳ Auth already in progress — check above for the Google code.\n"
+                "If stuck more than 5 min, wait 1 minute then try /auth again."
             )
             return
+        del _oauth_pending[uid]
 
-    status_msg = await update.message.reply_text(
-        "```\n"
-        "[CONTACTING GOOGLE...]\n"
-        "Requesting device auth code.\n"
-        "Takes 3-10 seconds.\n"
-        "```",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+    await update.message.reply_text("🔄 Contacting Google... please wait 5-10 seconds.")
 
-    # Capture the running loop BEFORE entering the thread
     loop = asyncio.get_running_loop()
     _oauth_pending[uid] = {"ts": time.time()}
 
-    def on_event(url: str | None, code: str | None, error: str | None = None):
-        """Called from background thread. url=None means flow is done."""
-
-        if url is not None:
-            # Show the auth URL + code to the admin
-            _oauth_pending[uid]["ts"] = time.time()
-            text = (
-                "```\n"
-                "[ACTION REQUIRED]\n"
-                "─────────────────────────────\n"
-                "1. Open on your phone:\n"
-                "```\n"
-                f"https://google.com/device\n"
-                "```\n"
-                "2. Enter this code:\n"
-                "```\n"
-                f"  {code}\n"
-                "```\n"
-                "3. Sign in with any Google account\n\n"
-                f"_Full URL: {url}_\n\n"
-                "_Bot confirms automatically. Waiting up to 5 min..._"
-            )
-            asyncio.run_coroutine_threadsafe(
-                safe_edit(status_msg, text, parse_mode=ParseMode.MARKDOWN),
-                loop,
-            )
-            return
-
-        # url is None → flow finished
-        _oauth_pending.pop(uid, None)
-
-        if error:
-            # Show the real error so we know what went wrong
-            err_safe = error[:200].replace("`", "'")
-            fail_text = (
-                f"```\n"
-                f"[AUTH ERROR]\n"
-                f"{err_safe}\n"
-                f"\n"
-                f"Run /auth again to retry.\n"
-                f"```"
-            )
-            asyncio.run_coroutine_threadsafe(
-                safe_edit(status_msg, fail_text, parse_mode=ParseMode.MARKDOWN_V2),
-                loop,
-            )
-            return
-
-        if oauth2_token_exists():
-            success_text = (
-                "```\n"
-                "[AUTH COMPLETE]\n"
-                "Google account linked!\n"
-                "Token saved permanently.\n"
-                "\n"
-                "All downloads now bypass\n"
-                "YouTube IP blocks.\n"
-                "No further setup needed.\n"
-                "```"
-            )
-            asyncio.run_coroutine_threadsafe(
-                safe_edit(status_msg, success_text, parse_mode=ParseMode.MARKDOWN_V2),
-                loop,
-            )
-        else:
-            fail_text = (
-                "```\n"
-                "[AUTH TIMED OUT]\n"
-                "Code not entered in time.\n"
-                "Run /auth again to retry.\n"
-                "```"
-            )
-            asyncio.run_coroutine_threadsafe(
-                safe_edit(status_msg, fail_text, parse_mode=ParseMode.MARKDOWN_V2),
-                loop,
-            )
-
-    def run_with_error_guard():
-        """Wrapper that catches all exceptions and reports them."""
+    def tg_send(text: str):
+        """Schedule a Telegram message from the background thread."""
+        future = asyncio.run_coroutine_threadsafe(
+            bot.send_message(chat_id=chat, text=text),
+            loop,
+        )
         try:
-            _run_oauth2_flow(on_event)
+            future.result(timeout=15)   # wait so we know if it succeeded
         except Exception as e:
-            logger.error("cmd_auth thread crash: %s", e)
-            _oauth_pending.pop(uid, None)
-            err = str(e)[:120].replace("`", "'")
-            asyncio.run_coroutine_threadsafe(
-                safe_edit(
-                    status_msg,
-                    f"```\n[OAUTH2 ERROR]\n{err}\nRun /auth to retry.\n```",
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                ),
-                loop,
+            logger.error("tg_send failed: %s | text=%s", e, text[:80])
+
+    def run_flow():
+        logger.info("OAuth2 thread started uid=%d chat=%d", uid, chat)
+        try:
+            # Step 1: request device code directly from Google
+            import httpx
+            r = httpx.post(_DEVICE_CODE_URL, data={
+                "client_id": _OAUTH_CLIENT_ID,
+                "scope":     _OAUTH_SCOPE,
+            }, timeout=30)
+            resp = r.json()
+            logger.info("OAuth2 device code response: %s", resp)
+
+            if "error" in resp or "device_code" not in resp:
+                _oauth_pending.pop(uid, None)
+                tg_send(f"❌ Google error: {resp.get('error','unknown')} — {resp.get('error_description','')}")
+                return
+
+            device_code      = resp["device_code"]
+            user_code        = resp["user_code"]
+            verification_url = resp.get("verification_url", "https://www.google.com/device")
+            interval         = int(resp.get("interval", 5))
+            expires_in       = int(resp.get("expires_in", 1800))
+
+            # Step 2: send code to admin
+            _oauth_pending[uid] = {"ts": time.time()}
+            tg_send(
+                f"🔑 GOOGLE AUTH CODE\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Step 1 — Open on your phone:\n"
+                f"{verification_url}\n\n"
+                f"Step 2 — Enter this code:\n"
+                f"   ➤  {user_code}\n\n"
+                f"Step 3 — Sign in with any Google account\n\n"
+                f"⏳ Bot will confirm automatically (waiting up to {expires_in//60} min)..."
             )
 
-    threading.Thread(target=run_with_error_guard, daemon=True, name="oauth2").start()
+            # Step 3: poll until approved or expired
+            deadline = time.time() + expires_in
+            while time.time() < deadline:
+                time.sleep(interval)
+                try:
+                    tr = httpx.post(_TOKEN_URL, data={
+                        "client_id":     _OAUTH_CLIENT_ID,
+                        "client_secret": _OAUTH_CLIENT_SECRET,
+                        "device_code":   device_code,
+                        "grant_type":    "urn:ietf:params:oauth:grant-type:device_code",
+                    }, timeout=30)
+                    token = tr.json()
+                    logger.debug("OAuth2 poll: %s", token.get("error", "pending"))
+
+                    if "access_token" in token:
+                        _write_ydlp_token(token)
+                        _oauth_pending.pop(uid, None)
+                        tg_send(
+                            "✅ AUTH COMPLETE!\n"
+                            "Google account linked. Token saved permanently.\n\n"
+                            "All YouTube downloads now bypass IP blocks! 🎉\n"
+                            "Try sending a YouTube link now."
+                        )
+                        return
+
+                    err = token.get("error", "")
+                    if err == "authorization_pending":
+                        continue
+                    if err == "slow_down":
+                        interval = min(interval + 5, 30)
+                        continue
+                    if err in ("access_denied", "expired_token"):
+                        _oauth_pending.pop(uid, None)
+                        tg_send(f"❌ Google said: {err}\nRun /auth again.")
+                        return
+
+                except Exception as pe:
+                    logger.warning("OAuth2 poll error: %s", pe)
+                    time.sleep(interval)
+
+            # Timed out
+            _oauth_pending.pop(uid, None)
+            tg_send("⏰ Auth timed out — code not entered in time.\nRun /auth again.")
+
+        except Exception as e:
+            logger.error("OAuth2 thread crash: %s", e, exc_info=True)
+            _oauth_pending.pop(uid, None)
+            tg_send(f"❌ OAuth2 error: {e}\n\nRun /auth again.")
+
+    threading.Thread(target=run_flow, daemon=True, name=f"oauth2-{uid}").start()
 
 
 async def cmd_authtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
