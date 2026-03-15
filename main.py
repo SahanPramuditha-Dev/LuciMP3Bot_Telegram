@@ -142,14 +142,32 @@ def fmt_uptime(sec: int) -> str:
     parts.append(f"{s}s")
     return " ".join(parts)
 
-def rich_progress_bar(pct: float, width: int = 14) -> str:
-    filled    = int(pct / 100 * width)
-    empty     = width - filled
-    fill_char = "▓" if pct < 33 else ("█" if pct < 66 else "▉")
-    return fill_char * filled + "░" * empty
+def rich_progress_bar(pct: float, width: int = 20) -> str:
+    filled = int(pct / 100 * width)
+    empty = width - filled
+    
+    # Gradient: green -> yellow -> red
+    green_len = int(0.5 * width)  # 50% green
+    yellow_len = int(0.3 * width) # 30% yellow
+    
+    if filled <= green_len:
+        fill = "🟩" * filled
+    elif filled <= green_len + yellow_len:
+        fill = "🟩" * green_len + "🟨" * (filled - green_len)
+    else:
+        fill = "🟩" * green_len + "🟨" * yellow_len + "🟥" * (filled - green_len - yellow_len)
+    
+    shine = "✦" if pct >= 90 else ""
+    return f"[{fill}{'⬜' * empty}{shine}]"
 
 def mini_wave(frame: int, width: int = 8) -> str:
     return "".join(WAVE[(i + frame) % len(WAVE)] for i in range(width))
+
+def phase_emoji(pct: float) -> str:
+    if pct < 10: return "🔄"
+    elif pct < 50: return "⬇️"
+    elif pct < 90: return "⚙️"
+    else: return "📤"
 
 def sanitize_title(title: str) -> str:
     title = re.sub(r'[\\/*?:"<>|#%&{}$!\'@+`=]', "_", title)
@@ -492,7 +510,7 @@ async def process(query, typ: str, quality: str, url: str, msg, worker_id: int):
         frame_counter["n"]       += 1
 
         bar      = rich_progress_bar(pct)
-        wave     = mini_wave(frame_counter["n"], width=6)
+        wave     = mini_wave(frame_counter["n"], 20)
         speed    = (d.get("_speed_str") or "—").strip()
         eta      = (d.get("_eta_str")   or "—").strip()
         size_str = (
