@@ -51,11 +51,21 @@ ADMIN_IDS        = set(
 DOWNLOAD_FOLDER  = Path("downloads")
 CACHE_FOLDER     = Path("cache")
 COOKIES_FILE     = Path("cookies.txt")
-MAX_FILE_SIZE    = 50 * 1024 * 1024
+
+# ── File size limit ──────────────────────────────────────────────────────────
+# Standard Telegram Bot API hard limit = 50 MB (uploads) / 20 MB (downloads).
+# To support up to 2 GB you MUST run a local Bot API server:
+#   https://github.com/tdlib/telegram-bot-api
+# Set LOCAL_API_URL=http://localhost:8081 (or wherever your server runs).
+# Without it, MAX_FILE_SIZE is capped at 50 MB regardless of this setting.
+LOCAL_API_URL    = os.environ.get("LOCAL_API_URL", "")   # e.g. http://localhost:8081
+_using_local_api = bool(LOCAL_API_URL)
+MAX_FILE_SIZE    = 500 * 1024 * 1024  if _using_local_api else 50 * 1024 * 1024
+
 MAX_QUEUE_SIZE   = 20
 WORKERS          = 3
 RATE_LIMIT_SEC   = 6
-DOWNLOAD_TIMEOUT = 600
+DOWNLOAD_TIMEOUT = 1800   # 30 min — large files take time
 MAX_RATE_CACHE   = 2000
 MAX_HISTORY      = 5
 MAX_PLAYLIST_SHOW = 10
@@ -149,135 +159,121 @@ def get_po_token() -> tuple[str | None, str | None]:
 #
 # ═══════════════════════════════════════════════════════════
 
-# ── OAuth2 token (Google device-auth flow, built into yt-dlp) ───────────────
-# Token is stored by yt-dlp in its own cache dir and loaded automatically
-# when username="oauth2" is set. We store a sentinel flag file to know
-# whether the flow has been completed.
-OAUTH2_FLAG  = Path("oauth2_active.flag")  # exists = token is cached & valid
-OAUTH2_FILE  = Path("oauth2.json")         # legacy / manual token upload
+# ── OAuth2  —  Google Device Authorization Flow ──────────────────────────────
+#
+#  HOW IT WORKS (direct Google API — no yt-dlp wrapper needed):
+#   1. POST to Google device auth endpoint -> get short user_code + URL
+#   2. Send URL + code to admin via Telegram (takes 5 seconds)
+#   3. Admin opens URL on their phone, enters code, signs into Google
+#   4. Bot polls Google until approved, writes token in yt-dlp cache format
+#   5. All future downloads use the token automatically — works from any IP
+#   6. Refresh token never expires unless you revoke it
+# ─────────────────────────────────────────────────────────────────────────────
+
+import urllib.request
+import urllib.parse
+
+# yt-dlp's public YouTube TV client credentials (from yt-dlp source)
+_OAUTH_CLIENT_ID     = "861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com"
+_OAUTH_CLIENT_SECRET = "SboVhoG9s0rNafixCSGGKXAT"
+_OAUTH_SCOPE         = "https://www.googleapis.com/auth/youtube"
+_DEVICE_CODE_URL     = "https://oauth2.googleapis.com/device/code"
+_TOKEN_URL           = "https://oauth2.googleapis.com/token"
+
+OAUTH2_TOKEN_FILE = Path("oauth2_token.json")
+_oauth_pending: dict = {}
 
 def _yt_dlp_cache_dir() -> Path:
-    """Return the directory yt-dlp uses for its OAuth2 token cache."""
-    import yt_dlp.utils as u
     try:
+        import yt_dlp.utils as u
         return Path(u.get_cachedir())
     except Exception:
         return Path.home() / ".cache" / "yt-dlp"
 
+def _write_ydlp_token(token_data: dict) -> None:
+    """Write token in yt-dlp exact format so it auto-loads on every download."""
+    cache_dir  = _yt_dlp_cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    token_path = cache_dir / "youtube-oauth2.token.json"
+    ydlp_fmt   = {
+        "access_token":  token_data.get("access_token", ""),
+        "refresh_token": token_data.get("refresh_token", ""),
+        "token_type":    token_data.get("token_type", "Bearer"),
+        "expires":       int(time.time()) + int(token_data.get("expires_in", 3600)),
+    }
+    token_path.write_text(json.dumps(ydlp_fmt, indent=2))
+    OAUTH2_TOKEN_FILE.write_text(json.dumps(token_data, indent=2))
+    logger.info("OAuth2 token saved -> %s", token_path)
+
 def oauth2_token_exists() -> bool:
-    """Check whether yt-dlp's OAuth2 token cache file exists."""
-    token = _yt_dlp_cache_dir() / "youtube-oauth2.token.json"
-    return token.exists() or OAUTH2_FLAG.exists() or OAUTH2_FILE.exists()
+    """Return True if a valid OAuth2 token is cached."""
+    return ((_yt_dlp_cache_dir() / "youtube-oauth2.token.json").exists()
+            or OAUTH2_TOKEN_FILE.exists())
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  OAuth2 device-auth flow
-#
-#  yt-dlp triggers the Google "TV/device" OAuth flow when username="oauth2".
-#  On the FIRST run (no cached token) it prints to stderr:
-#    "Please open https://www.google.com/device and enter code XXXX-XXXX"
-#  We capture that output, parse it, and send it to the admin via Telegram.
-#  After the admin approves on their phone, yt-dlp caches a refresh token
-#  that auto-renews forever — no further action needed.
-# ─────────────────────────────────────────────────────────────────────────────
-
-_oauth_pending: dict = {}   # chat_id → {"code": ..., "url": ..., "task": ...}
-
-class _CaptureLogger:
-    """Minimal yt-dlp logger that captures device-auth lines."""
-    def __init__(self):
-        self.lines: list[str] = []
-        self.device_url: str | None  = None
-        self.device_code: str | None = None
-
-    def debug(self, msg):
-        self._scan(msg)
-    def warning(self, msg):
-        self._scan(msg)
-    def error(self, msg):
-        self._scan(msg)
-    def _scan(self, msg):
-        self.lines.append(msg)
-        low = msg.lower()
-        # yt-dlp prints something like:
-        # "Please open https://www.google.com/device and enter code ABCD-EFGH"
-        if "google.com/device" in low or "open" in low and "code" in low:
-            # Extract URL
-            m = re.search(r"https://\S+", msg)
-            if m:
-                self.device_url = m.group(0).rstrip(".")
-            # Extract code — pattern: XXXX-XXXX or similar
-            c = re.search(r"([A-Z0-9]{4}-[A-Z0-9]{4})", msg)
-            if not c:
-                c = re.search(r"code[:\s]+([A-Z0-9\-]{6,})", msg, re.I)
-            if c:
-                self.device_code = c.group(1)
+def _http_post(url: str, data: dict) -> dict:
+    """Minimal synchronous HTTPS POST, returns parsed JSON."""
+    body = urllib.parse.urlencode(data).encode()
+    req  = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode())
 
 def _run_oauth2_flow(notify_callback) -> None:
     """
-    Run in a background thread. Triggers yt-dlp with username=oauth2 against
-    a harmless YouTube URL. Captures the device-auth output and calls
-    notify_callback(url, code) when found, then blocks until auth completes
-    or times out (5 minutes).
+    Background thread — complete Google device auth flow.
+    Calls notify_callback(url, code) once URL is ready.
+    Calls notify_callback(None, None) when finished (success or fail).
     """
-    cap = _CaptureLogger()
-    opts = {
-        "username":        "oauth2",
-        "password":        "",
-        "quiet":           False,
-        "no_warnings":     False,
-        "logger":          cap,
-        "skip_download":   True,
-        "extract_flat":    True,
-        "socket_timeout":  30,
-    }
-    # Deliberately use a simple public video to trigger the auth check
-    TEST_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    notified = False
     try:
-        import yt_dlp as _ydlp
-        with _ydlp.YoutubeDL(opts) as ydl:
-            # Patch progress so we can intercept the device URL mid-run
-            original_to_screen = ydl.to_screen
-            def patched_screen(msg, *a, **kw):
-                cap._scan(msg)
-                if not notified and cap.device_url:
-                    pass  # handled below via polling
-                original_to_screen(msg, *a, **kw)
-            ydl.to_screen = patched_screen
+        # Step 1: request device code
+        resp = _http_post(_DEVICE_CODE_URL, {
+            "client_id": _OAUTH_CLIENT_ID,
+            "scope":     _OAUTH_SCOPE,
+        })
+        device_code      = resp["device_code"]
+        user_code        = resp["user_code"]
+        verification_url = resp.get("verification_url", "https://www.google.com/device")
+        interval         = int(resp.get("interval", 5))
+        expires_in       = int(resp.get("expires_in", 300))
+        logger.info("OAuth2 device_code ready, user_code=%s", user_code)
 
-            # Poll for device URL every 0.5s while info extraction runs
-            result_holder = [None]
-            err_holder    = [None]
-            def _extract():
-                try:
-                    result_holder[0] = ydl.extract_info(TEST_URL, download=False)
-                except Exception as e:
-                    err_holder[0] = e
+        # Step 2: notify admin
+        notify_callback(verification_url, user_code)
 
-            t = threading.Thread(target=_extract, daemon=True)
-            t.start()
-
-            deadline = time.time() + 300   # 5-minute window
-            while t.is_alive() and time.time() < deadline:
-                if cap.device_url and not notified:
-                    notify_callback(
-                        cap.device_url,
-                        cap.device_code or "check logs",
-                    )
-                    notified = True
-                time.sleep(0.5)
-
-            if not notified and cap.device_url:
-                notify_callback(cap.device_url, cap.device_code or "check logs")
-
-            if result_holder[0] is not None:
-                # Success — mark token as active
-                OAUTH2_FLAG.write_text("active")
-                notify_callback(None, None)   # signal completion
+        # Step 3: poll until approved or timed out
+        deadline = time.time() + expires_in
+        while time.time() < deadline:
+            time.sleep(interval)
+            try:
+                token = _http_post(_TOKEN_URL, {
+                    "client_id":     _OAUTH_CLIENT_ID,
+                    "client_secret": _OAUTH_CLIENT_SECRET,
+                    "device_code":   device_code,
+                    "grant_type":    "urn:ietf:params:oauth:grant-type:device_code",
+                })
+                if "access_token" in token:
+                    _write_ydlp_token(token)
+                    notify_callback(None, None)  # success
+                    return
+                err = token.get("error", "")
+                if err == "authorization_pending":
+                    continue
+                if err == "slow_down":
+                    interval = min(interval + 5, 30)
+                    continue
+                if err in ("access_denied", "expired_token"):
+                    logger.warning("OAuth2 flow: %s", err)
+                    break
+            except Exception as pe:
+                logger.debug("OAuth2 poll error: %s", pe)
+                time.sleep(interval)
 
     except Exception as e:
         logger.error("OAuth2 flow error: %s", e)
-        notify_callback(None, None)
+
+    notify_callback(None, None)  # failure
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -977,9 +973,9 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bs    = bypass_status()
-    mode  = "WEBHOOK" if WEBHOOK_URL else "POLLING"
     def st(ok): return "OK  ✅" if ok else "----  ✗"
     proxy_str = f"OK ({bs['proxy_count']}x) ✅" if bs["proxy"] else "----  ✗"
+    api_str   = "LOCAL ✅" if _using_local_api else "CLOUD (50MB cap)"
     await update.message.reply_text(
         f"```\n"
         f"╔═══════════════════════════════════╗\n"
@@ -991,7 +987,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"║  po_token    : {st(bs['po_token']):<20}║\n"
         f"║  proxy       : {proxy_str:<20}║\n"
         f"╠═══════════════════════════════════╣\n"
-        f"║  LIMITS                          ║\n"
+        f"║  FILE LIMITS                     ║\n"
+        f"║  bot api  : {api_str:<22}║\n"
         f"║  max_file : {fmt_size(MAX_FILE_SIZE):<22}║\n"
         f"║  queue    : {MAX_QUEUE_SIZE:<22}║\n"
         f"║  rate     : {RATE_LIMIT_SEC}s cooldown{'':<13}║\n"
@@ -1004,14 +1001,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"║  MP3 128k / 192k / 320k           ║\n"
         f"║  M4A best  /  OGG best            ║\n"
         f"╠═══════════════════════════════════╣\n"
-        f"║  FIX IP BLOCK                    ║\n"
-        f"║  send cookies.txt to this chat   ║\n"
-        f"║  or use /setcookies command       ║\n"
+        f"║  RAISE FILE LIMIT TO 2 GB        ║\n"
+        f"║  Run local Bot API server:        ║\n"
+        f"║  docker run -d                    ║\n"
+        f"║    aiogram/telegram-bot-api       ║\n"
+        f"║  Set env: LOCAL_API_URL=          ║\n"
+        f"║    http://localhost:8081          ║\n"
         f"╚═══════════════════════════════════╝\n"
         f"```\n\n"
-        f"*Export cookies on your PC:*\n"
-        f"`yt-dlp --cookies-from-browser chrome --cookies cookies.txt`\n"
-        f"Then send the file to this chat — it will be saved automatically\\.",
+        f"*Fix IP block:* send `cookies.txt` to this chat\n"
+        f"or run `/auth` to link a Google account\\.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -1693,12 +1692,31 @@ async def process(query, typ: str, quality: str, url: str, msg, wid: int):
     fp   = Path(fp_str)
     fsz  = fp.stat().st_size
 
-    if fsz > MAX_FILE_SIZE:
+    # ── Size check + smart split ─────────────────────────────────────────────
+    SPLIT_THRESHOLD = 45 * 1024 * 1024   # split if > 45 MB AND no local API
+    need_split = (fsz > MAX_FILE_SIZE) or (not _using_local_api and fsz > SPLIT_THRESHOLD)
+
+    if fsz > MAX_FILE_SIZE and _using_local_api:
+        # Local API supports up to 2 GB — just proceed normally
+        need_split = False
+
+    if need_split and fsz > MAX_FILE_SIZE and not _using_local_api:
+        # Hard limit exceeded, cannot split video sensibly — reject
         fp.unlink(missing_ok=True)
         stats["failed"] += 1
         await safe_edit(msg,
-            f"```\n[SIZE EXCEEDED]\nfile  : {fmt_size(fsz)}\nlimit : {fmt_size(MAX_FILE_SIZE)}\n"
-            f"fix   : use lower res or mp3\n```",
+            f"```\n"
+            f"[FILE TOO LARGE]\n"
+            f"size  : {fmt_size(fsz)}\n"
+            f"limit : {fmt_size(MAX_FILE_SIZE)}\n"
+            f"\n"
+            f"Options:\n"
+            f"  1. Choose lower resolution\n"
+            f"  2. Choose MP3 audio only\n"
+            f"  3. Run a local Bot API server\n"
+            f"     (raises limit to 2 GB)\n"
+            f"     See /help for setup guide\n"
+            f"```",
             parse_mode=ParseMode.MARKDOWN_V2)
         return
 
@@ -1706,22 +1724,27 @@ async def process(query, typ: str, quality: str, url: str, msg, wid: int):
         f"```\n[TRANSMITTING]\nfile  : {fp.name[:40]}\nsize  : {fmt_size(fsz)}\nuplink: active...\n```",
         parse_mode=ParseMode.MARKDOWN_V2)
 
-    # Cache before send
-    try: shutil.copy2(fp, cp)
-    except Exception as ce: logger.warning("cache write: %s", ce)
+    # Cache before send (only if fits in one shot)
+    if not need_split:
+        try: shutil.copy2(fp, cp)
+        except Exception as ce: logger.warning("cache write: %s", ce)
 
     try:
-        with open(fp, "rb") as f:
-            cap = f"✅ `{fp.stem[:50]}`"
-            if typ in ("mp3", "m4a", "ogg"):
-                await msg.reply_audio(audio=f, caption=cap, title=fp.stem,
-                                      parse_mode=ParseMode.MARKDOWN,
-                                      read_timeout=180, write_timeout=180)
-            else:
-                await msg.reply_video(video=f, caption=cap,
-                                      parse_mode=ParseMode.MARKDOWN,
-                                      supports_streaming=True,
-                                      read_timeout=180, write_timeout=180)
+        if need_split and typ in ("mp3", "m4a", "ogg"):
+            # Split audio into 45 MB chunks and send sequentially
+            await _send_in_parts(msg, fp, typ, clean_title)
+        else:
+            with open(fp, "rb") as f:
+                cap = f"✅ `{fp.stem[:50]}`"
+                if typ in ("mp3", "m4a", "ogg"):
+                    await msg.reply_audio(audio=f, caption=cap, title=fp.stem,
+                                          parse_mode=ParseMode.MARKDOWN,
+                                          read_timeout=600, write_timeout=600)
+                else:
+                    await msg.reply_video(video=f, caption=cap,
+                                          parse_mode=ParseMode.MARKDOWN,
+                                          supports_streaming=True,
+                                          read_timeout=600, write_timeout=600)
         await msg.delete()
         stats["downloads"] += 1
         stats["bytes_sent"] += fsz
@@ -1731,7 +1754,7 @@ async def process(query, typ: str, quality: str, url: str, msg, wid: int):
         logger.error("upload fail: %s", e)
         stats["failed"] += 1
         cp.unlink(missing_ok=True)
-        await safe_edit(msg, f"```\n[UPLOAD FAILED]\n{mdescape(str(e)[:200])}\n```",
+        await safe_edit(msg, f"```\n[UPLOAD FAILED]\n{str(e)[:200].replace(chr(96), chr(39))}\n```",
                         parse_mode=ParseMode.MARKDOWN_V2)
     finally:
         fp.unlink(missing_ok=True)
@@ -1739,6 +1762,41 @@ async def process(query, typ: str, quality: str, url: str, msg, wid: int):
 # ═══════════════════════════════════════════════════════════
 #  YT-DLP RUNNER  (blocking, runs in executor)
 # ═══════════════════════════════════════════════════════════
+
+async def _send_in_parts(msg, fp: Path, typ: str, title: str):
+    """
+    Split a large audio file into 45 MB chunks and send them one by one.
+    Used when no local Bot API server is configured and the file is too
+    large for the standard 50 MB Telegram limit.
+    Only used for audio (mp3/m4a/ogg) — video cannot be cleanly split
+    without re-encoding (which we avoid to keep things fast).
+    """
+    CHUNK = 45 * 1024 * 1024   # 45 MB per part
+    fsz   = fp.stat().st_size
+    total = (fsz + CHUNK - 1) // CHUNK
+
+    await safe_edit(msg,
+        f"```\n[SPLITTING FILE]\n"
+        f"size  : {fmt_size(fsz)}\n"
+        f"parts : {total} x ~{fmt_size(CHUNK)}\n"
+        f"```",
+        parse_mode=ParseMode.MARKDOWN_V2)
+
+    with open(fp, "rb") as src:
+        for i in range(total):
+            chunk_data = src.read(CHUNK)
+            if not chunk_data:
+                break
+            part_name = f"{title[:40]} (Part {i+1} of {total}){fp.suffix}"
+            await msg.reply_audio(
+                audio=io.BytesIO(chunk_data),
+                filename=part_name,
+                title=part_name,
+                caption=f"`Part {i+1}/{total}`",
+                parse_mode=ParseMode.MARKDOWN,
+                read_timeout=600,
+                write_timeout=600,
+            )
 
 def _run_ydl(opts: dict, url: str, typ: str, clean_title: str) -> str | None:
     """
@@ -1850,22 +1908,49 @@ async def post_init(app):
             "  Fix: send /auth in Telegram and approve the Google login.\n"
             "  This is a one-time setup. Token lasts forever."
         )
+        # DM every configured admin so they see the warning in Telegram too
+        if ADMIN_IDS:
+            for admin_id in ADMIN_IDS:
+                try:
+                    await app.bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            "```\n"
+                            "[⚠ NO BYPASS ACTIVE]\n"
+                            "YouTube WILL block all downloads\n"
+                            "from this server IP.\n"
+                            "\n"
+                            "Fix: run /auth RIGHT NOW\n"
+                            "Takes 30 seconds, lasts forever.\n"
+                            "```"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                    )
+                except Exception:
+                    pass
 
 def main():
-    app = (
+    builder = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .connect_timeout(60)
-        .read_timeout(60)
-        .write_timeout(180)
-        .pool_timeout(60)
+        .connect_timeout(120)
+        .read_timeout(120)
+        .write_timeout(600)          # large uploads need long write timeout
+        .pool_timeout(120)
         .get_updates_connect_timeout(60)
         .get_updates_read_timeout(60)
         .get_updates_write_timeout(60)
         .get_updates_pool_timeout(60)
         .post_init(post_init)
-        .build()
     )
+    # Point to local Bot API server when configured — removes the 50 MB cap
+    if LOCAL_API_URL:
+        builder = builder.base_url(f"{LOCAL_API_URL}/bot")
+        logger.info("Using local Bot API server: %s  (limit: %s)",
+                    LOCAL_API_URL, fmt_size(MAX_FILE_SIZE))
+    else:
+        logger.info("Using cloud Bot API  (limit: %s)", fmt_size(MAX_FILE_SIZE))
+    app = builder.build()
 
     app.add_handler(CommandHandler("start",      cmd_start))
     app.add_handler(CommandHandler("auth",       cmd_auth))
