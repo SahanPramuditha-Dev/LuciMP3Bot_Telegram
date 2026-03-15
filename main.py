@@ -22,7 +22,7 @@
   • Hacker-terminal  — matrix-style progress bars & status
 """
 
-import os, re, json, shutil, asyncio, logging, time, hashlib, subprocess
+import os, re, json, shutil, asyncio, logging, time, hashlib, subprocess, threading, io
 from pathlib import Path
 from collections import OrderedDict, defaultdict
 
@@ -60,7 +60,25 @@ MAX_RATE_CACHE   = 2000
 MAX_HISTORY      = 5
 MAX_PLAYLIST_SHOW = 10
 FFMPEG_LOCATION  = os.environ.get("FFMPEG_LOCATION", None)
-HTTP_PROXY       = os.environ.get("HTTP_PROXY", None)
+
+# ── Proxy config ────────────────────────────────────────────────────────────
+# Single proxy:  HTTP_PROXY=http://user:pass@host:port
+# Multi/rotating: PROXY_LIST=http://u:p@h1:p1,http://u:p@h2:p2,...
+# The bot round-robins across the list on each download.
+HTTP_PROXY   = os.environ.get("HTTP_PROXY", None)
+_PROXY_LIST  = [p.strip() for p in os.environ.get("PROXY_LIST", "").split(",") if p.strip()]
+if HTTP_PROXY and HTTP_PROXY not in _PROXY_LIST:
+    _PROXY_LIST.insert(0, HTTP_PROXY)
+_proxy_index = 0
+
+def get_next_proxy() -> str | None:
+    """Round-robin over the proxy list. Returns None if no proxies configured."""
+    global _proxy_index
+    if not _PROXY_LIST:
+        return None
+    p = _PROXY_LIST[_proxy_index % len(_PROXY_LIST)]
+    _proxy_index += 1
+    return p
 
 DOWNLOAD_FOLDER.mkdir(exist_ok=True)
 CACHE_FOLDER.mkdir(exist_ok=True)
@@ -114,22 +132,152 @@ def get_po_token() -> tuple[str | None, str | None]:
     return _po_token, _visitor_data
 
 # ═══════════════════════════════════════════════════════════
-#  YT-DLP CONFIG
+#  YT-DLP CONFIG  —  multi-layer bypass
+# ═══════════════════════════════════════════════════════════
+#
+#  Why server IPs get blocked:
+#    YouTube detects datacenter/VPS ASNs and requires proof of a real
+#    browser session before serving video data.
+#
+#  Bypass priority (strongest first):
+#    1. cookies.txt  — exported from a logged-in Chrome/Firefox session
+#    2. OAuth2 token — yt-dlp's built-in --username oauth2 flow
+#    3. PO token     — requires youtube-po-token-generator npm package
+#    4. tv_embedded  — embedded TV client, often skips auth check
+#    5. ios/android  — mobile clients, different code path
+#    6. HTTP_PROXY   — residential/ISP proxy env var (best permanent fix)
+#
 # ═══════════════════════════════════════════════════════════
 
-_YT_CLIENTS_BASE = ["tv_embedded", "ios", "android"]
+# ── OAuth2 token (Google device-auth flow, built into yt-dlp) ───────────────
+# Token is stored by yt-dlp in its own cache dir and loaded automatically
+# when username="oauth2" is set. We store a sentinel flag file to know
+# whether the flow has been completed.
+OAUTH2_FLAG  = Path("oauth2_active.flag")  # exists = token is cached & valid
+OAUTH2_FILE  = Path("oauth2.json")         # legacy / manual token upload
 
-def build_extractor_args() -> dict:
-    po, vis = get_po_token()
-    clients = list(_YT_CLIENTS_BASE)
-    yt: dict = {"player_client": clients}
-    if po:
-        clients.insert(0, "web")
-        yt["player_client"] = clients
-        yt["po_token"]      = [f"web+{po}"]
-    if vis:
-        yt["visitor_data"]  = [vis]
-    return {"youtube": yt}
+def _yt_dlp_cache_dir() -> Path:
+    """Return the directory yt-dlp uses for its OAuth2 token cache."""
+    import yt_dlp.utils as u
+    try:
+        return Path(u.get_cachedir())
+    except Exception:
+        return Path.home() / ".cache" / "yt-dlp"
+
+def oauth2_token_exists() -> bool:
+    """Check whether yt-dlp's OAuth2 token cache file exists."""
+    token = _yt_dlp_cache_dir() / "youtube-oauth2.token.json"
+    return token.exists() or OAUTH2_FLAG.exists() or OAUTH2_FILE.exists()
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  OAuth2 device-auth flow
+#
+#  yt-dlp triggers the Google "TV/device" OAuth flow when username="oauth2".
+#  On the FIRST run (no cached token) it prints to stderr:
+#    "Please open https://www.google.com/device and enter code XXXX-XXXX"
+#  We capture that output, parse it, and send it to the admin via Telegram.
+#  After the admin approves on their phone, yt-dlp caches a refresh token
+#  that auto-renews forever — no further action needed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_oauth_pending: dict = {}   # chat_id → {"code": ..., "url": ..., "task": ...}
+
+class _CaptureLogger:
+    """Minimal yt-dlp logger that captures device-auth lines."""
+    def __init__(self):
+        self.lines: list[str] = []
+        self.device_url: str | None  = None
+        self.device_code: str | None = None
+
+    def debug(self, msg):
+        self._scan(msg)
+    def warning(self, msg):
+        self._scan(msg)
+    def error(self, msg):
+        self._scan(msg)
+    def _scan(self, msg):
+        self.lines.append(msg)
+        low = msg.lower()
+        # yt-dlp prints something like:
+        # "Please open https://www.google.com/device and enter code ABCD-EFGH"
+        if "google.com/device" in low or "open" in low and "code" in low:
+            # Extract URL
+            m = re.search(r"https://\S+", msg)
+            if m:
+                self.device_url = m.group(0).rstrip(".")
+            # Extract code — pattern: XXXX-XXXX or similar
+            c = re.search(r"([A-Z0-9]{4}-[A-Z0-9]{4})", msg)
+            if not c:
+                c = re.search(r"code[:\s]+([A-Z0-9\-]{6,})", msg, re.I)
+            if c:
+                self.device_code = c.group(1)
+
+def _run_oauth2_flow(notify_callback) -> None:
+    """
+    Run in a background thread. Triggers yt-dlp with username=oauth2 against
+    a harmless YouTube URL. Captures the device-auth output and calls
+    notify_callback(url, code) when found, then blocks until auth completes
+    or times out (5 minutes).
+    """
+    cap = _CaptureLogger()
+    opts = {
+        "username":        "oauth2",
+        "password":        "",
+        "quiet":           False,
+        "no_warnings":     False,
+        "logger":          cap,
+        "skip_download":   True,
+        "extract_flat":    True,
+        "socket_timeout":  30,
+    }
+    # Deliberately use a simple public video to trigger the auth check
+    TEST_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    notified = False
+    try:
+        import yt_dlp as _ydlp
+        with _ydlp.YoutubeDL(opts) as ydl:
+            # Patch progress so we can intercept the device URL mid-run
+            original_to_screen = ydl.to_screen
+            def patched_screen(msg, *a, **kw):
+                cap._scan(msg)
+                if not notified and cap.device_url:
+                    pass  # handled below via polling
+                original_to_screen(msg, *a, **kw)
+            ydl.to_screen = patched_screen
+
+            # Poll for device URL every 0.5s while info extraction runs
+            result_holder = [None]
+            err_holder    = [None]
+            def _extract():
+                try:
+                    result_holder[0] = ydl.extract_info(TEST_URL, download=False)
+                except Exception as e:
+                    err_holder[0] = e
+
+            t = threading.Thread(target=_extract, daemon=True)
+            t.start()
+
+            deadline = time.time() + 300   # 5-minute window
+            while t.is_alive() and time.time() < deadline:
+                if cap.device_url and not notified:
+                    notify_callback(
+                        cap.device_url,
+                        cap.device_code or "check logs",
+                    )
+                    notified = True
+                time.sleep(0.5)
+
+            if not notified and cap.device_url:
+                notify_callback(cap.device_url, cap.device_code or "check logs")
+
+            if result_holder[0] is not None:
+                # Success — mark token as active
+                OAUTH2_FLAG.write_text("active")
+                notify_callback(None, None)   # signal completion
+
+    except Exception as e:
+        logger.error("OAuth2 flow error: %s", e)
+        notify_callback(None, None)
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -137,11 +285,24 @@ _UA = (
     "Chrome/125.0.0.0 Safari/537.36"
 )
 
+def build_extractor_args() -> dict:
+    po, vis = get_po_token()
+    # tv_embedded works without cookies on most IPs; ios/android as fallback
+    clients: list[str] = ["tv_embedded", "ios", "android"]
+    yt: dict = {"player_client": clients}
+    if po:
+        clients = ["web"] + clients
+        yt["player_client"] = clients
+        yt["po_token"]      = [f"web+{po}"]
+    if vis:
+        yt["visitor_data"] = [vis]
+    return {"youtube": yt}
+
 def build_ydl_common() -> dict:
     opts: dict = {
         "quiet":            True,
         "no_warnings":      True,
-        "http_headers":     {
+        "http_headers": {
             "User-Agent":      _UA,
             "Accept-Language": "en-US,en;q=0.9",
             "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -151,25 +312,52 @@ def build_ydl_common() -> dict:
         "retries":          5,
         "fragment_retries": 5,
     }
+    # cookies.txt  — strongest auth signal
     if COOKIES_FILE.exists():
         opts["cookiefile"] = str(COOKIES_FILE)
+        logger.debug("Using cookies.txt")
+    # OAuth2 — yt-dlp's own cached refresh token (survives IP changes, lasts forever)
+    if oauth2_token_exists():
+        opts["username"] = "oauth2"
+        opts["password"] = ""
+        logger.debug("Using OAuth2 token")
     if FFMPEG_LOCATION:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
-    if HTTP_PROXY:
-        opts["proxy"] = HTTP_PROXY
+    proxy = get_next_proxy()
+    if proxy:
+        opts["proxy"] = proxy
+        logger.debug("Using proxy: %s…", proxy[:30])
     return opts
 
+# Fallback extractor_args tried one-by-one when primary is blocked
 _FALLBACK_CLIENTS: list[dict] = [
     {"youtube": {"player_client": ["tv_embedded"]}},
     {"youtube": {"player_client": ["ios"]}},
     {"youtube": {"player_client": ["mweb"]}},
     {"youtube": {"player_client": ["android"]}},
     {"youtube": {"player_client": ["android_vr"]}},
+    # Last resort: web with no po_token (sometimes works on fresh IPs)
+    {"youtube": {"player_client": ["web"]}},
 ]
 
 def _is_bot_block(e: Exception) -> bool:
     m = str(e).lower()
-    return any(k in m for k in ["sign in", "signin", "bot", "confirm you", "403", "429"])
+    return any(k in m for k in [
+        "sign in", "signin", "bot", "confirm you",
+        "403", "429", "blocked", "not available",
+        "video unavailable",
+    ])
+
+def bypass_status() -> dict:
+    """Return current state of each bypass method for display."""
+    po, _ = get_po_token()
+    return {
+        "cookies":     COOKIES_FILE.exists(),
+        "oauth2":      oauth2_token_exists(),
+        "po_token":    bool(po),
+        "proxy":       len(_PROXY_LIST) > 0,
+        "proxy_count": len(_PROXY_LIST),
+    }
 
 # ═══════════════════════════════════════════════════════════
 #  GLOBALS
@@ -234,8 +422,8 @@ def _phase(pct: float) -> str:
     return _DL_PHASES[idx]
 
 def _glitch(text: str, frame: int) -> str:
-    """Occasionally corrupt one char for a glitch effect (frame-based)."""
-    glitch_chars = "▒░▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌"
+    """Occasionally corrupt one char — only block chars safe inside ``` fences."""
+    glitch_chars = "▒░▓▌▐▀▄█▊▋▍▎▏▶◀◆◇○●◉"
     if frame % 7 == 0 and len(text) > 4:
         pos = (frame * 3) % len(text)
         c   = glitch_chars[(frame * 13) % len(glitch_chars)]
@@ -271,7 +459,9 @@ def fmt_uptime(sec: int) -> str:
     return " ".join(parts)
 
 def sanitize(title: str) -> str:
+    # backticks break ``` fences in Telegram markdown
     title = re.sub(r'[\\/*?:"<>|#%&{}$!\'@+`=]', "_", title)
+    title = title.replace("`", "'")
     return re.sub(r'\s+', " ", title).strip()[:120]
 
 def ckey(url: str, typ: str, q: str) -> str:
@@ -279,6 +469,23 @@ def ckey(url: str, typ: str, q: str) -> str:
 
 def mdescape(t: str) -> str:
     return re.sub(r'([_*\[\]()~`>#+=|{}.!\\-])', r'\\\1', t)
+
+def normalize_url(entry: dict) -> str:
+    """
+    extract_flat entries sometimes have 'url' as a bare video ID.
+    Always return a canonical https://www.youtube.com/watch?v=... URL.
+    """
+    raw    = (entry.get("url") or "").strip()
+    vid_id = (entry.get("id")  or "").strip()
+    if raw.startswith("http"):
+        return raw
+    # Prefer the explicit id field
+    if vid_id:
+        return f"https://www.youtube.com/watch?v={vid_id}"
+    # Fall back to treating raw as an id if it looks like one
+    if raw and "/" not in raw and len(raw) <= 15:
+        return f"https://www.youtube.com/watch?v={raw}"
+    return raw
 
 async def safe_edit(msg, text: str, **kw):
     try:
@@ -307,22 +514,51 @@ def push_history(user: int, title: str, typ: str, quality: str):
 
 def error_msg(e: Exception) -> str:
     m = str(e); low = m.lower()
-    if any(k in low for k in ["sign in", "bot", "confirm you"]):
+    bs = bypass_status()
+
+    if any(k in low for k in ["sign in", "bot", "confirm you", "403", "blocked"]):
+        active = []
+        if bs["cookies"]:  active.append("cookies.txt")
+        if bs["oauth2"]:   active.append("oauth2")
+        if bs["po_token"]: active.append("PO token")
+        if bs["proxy"]:    active.append("proxy")
+        active_str = ", ".join(active) if active else "none"
         return (
-            "```\n[ACCESS DENIED]\n```\n"
-            "⛔ *YouTube requires authentication*\n\n"
-            "The bot exhausted all bypass clients\\.\n\n"
-            "*Fix:*\n"
-            "1\\. Export cookies: `yt\\-dlp \\-\\-cookies\\-from\\-browser chrome \\-\\-cookies cookies\\.txt`\n"
-            "2\\. Place `cookies\\.txt` next to `bot\\.py`\n"
-            "3\\. Install `youtube\\-po\\-token\\-generator`"
+            f"```\n"
+            f"[ACCESS DENIED - IP BLOCKED]\n"
+            f"active bypass : {active_str}\n"
+            f"all clients   : exhausted\n"
+            f"```\n\n"
+            f"*Fix — send your cookies to this bot:*\n"
+            f"1\\. On your PC, run:\n"
+            f"`yt-dlp --cookies-from-browser chrome --cookies cookies.txt`\n"
+            f"2\\. Send the `cookies.txt` file to this chat\n"
+            f"   The bot will auto\\-detect and save it\\.\n\n"
+            f"_Or set `HTTP\\_PROXY` env var to a residential proxy\\._"
         )
-    if "403" in m:   return "```\n[ERR 403 FORBIDDEN]\n```\nServer IP blocked\\. Use cookies or proxy\\."
-    if "429" in m:   return "```\n[ERR 429 RATE LIMIT]\n```\nToo many requests\\. Wait a few minutes\\."
-    if "private" in low: return "```\n[LOCKED CONTENT]\n```\nVideo is private or age\\-restricted\\."
-    if "geo" in low: return "```\n[GEO BLOCK]\n```\nVideo is unavailable in the server region\\."
-    if "copyright" in low: return "```\n[DMCA BLOCK]\n```\nVideo blocked due to copyright\\."
-    return f"```\n[DOWNLOAD FAILED]\n{mdescape(m[:250])}\n```"
+    if "429" in m:
+        return (
+            "```\n[RATE LIMITED 429]\n"
+            "YouTube throttling this IP.\n"
+            "Wait 5-10 min and retry.\n```"
+        )
+    if "private" in low:
+        return (
+            "```\n[LOCKED CONTENT]\n"
+            "Video is private or age-restricted.\n"
+            "Send cookies.txt from a logged-in\n"
+            "YouTube session to unlock.\n```"
+        )
+    if "geo" in low or "not available in your country" in low:
+        return (
+            "```\n[GEO BLOCK]\n"
+            "Video unavailable in server region.\n"
+            "Set HTTP_PROXY env var to bypass.\n```"
+        )
+    if "copyright" in low:
+        return "```\n[DMCA BLOCK]\nVideo blocked by copyright claim.\n```"
+    safe = m[:250].replace("`", "'").replace("\\", "/")
+    return f"```\n[DOWNLOAD FAILED]\n{safe}\n```"
 
 # ═══════════════════════════════════════════════════════════
 #  VIDEO INFO  —  with client fallback chain
@@ -500,7 +736,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"`/search` — search YouTube\n"
         f"`/info`   — inspect target URL\n"
         f"`/playlist` — extract playlist\n"
-        f"`/trending` — trending videos\n"
+        f"`/trending` — trending [music/gaming/news]\n"
         f"`/history` — your download log\n"
         f"`/queue`  — mission queue status\n"
         f"`/stats`  — system telemetry\n"
@@ -509,6 +745,219 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"_Drop any URL to begin extraction_",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+async def cmd_setcookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tell the user exactly how to upload cookies."""
+    await update.message.reply_text(
+        "```\n"
+        "[COOKIE UPLOAD INSTRUCTIONS]\n"
+        "─────────────────────────────\n"
+        "Step 1: Export on your PC\n"
+        "  yt-dlp --cookies-from-browser chrome \\\n"
+        "         --cookies cookies.txt\n"
+        "\n"
+        "Step 2: Send the file\n"
+        "  Attach cookies.txt to this chat\n"
+        "  as a FILE (not a photo/text)\n"
+        "\n"
+        "The bot will auto-save and activate it.\n"
+        "─────────────────────────────\n"
+        "Supported browsers:\n"
+        "  chrome / firefox / edge /\n"
+        "  safari / brave / opera\n"
+        "```",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Auto-detect cookies.txt uploaded as a Telegram document.
+    Any admin (or any user if ADMIN_IDS is empty) can upload.
+    """
+    doc  = update.message.document
+    uid  = update.effective_user.id
+
+    # Restrict to admins if configured
+    if ADMIN_IDS and uid not in ADMIN_IDS:
+        await update.message.reply_text(
+            "```\n[RESTRICTED]\nOnly admins can upload cookies.\n```",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    fname = (doc.file_name or "").lower()
+    if "cookie" not in fname and not fname.endswith(".txt"):
+        # Not a cookies file — ignore silently
+        return
+
+    msg = await update.message.reply_text(
+        "```\n[RECEIVING COOKIES...]\n```", parse_mode=ParseMode.MARKDOWN_V2
+    )
+    try:
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(str(COOKIES_FILE))
+
+        # Quick sanity check — valid Netscape cookie files start with # Netscape
+        raw = COOKIES_FILE.read_text(errors="ignore")[:200]
+        if "HTTP Cookie File" not in raw and "Netscape" not in raw and "#" not in raw[:5]:
+            COOKIES_FILE.unlink(missing_ok=True)
+            await safe_edit(msg,
+                "```\n[INVALID FILE]\nNot a valid Netscape cookies.txt\n"
+                "Export using:\n"
+                "yt-dlp --cookies-from-browser chrome --cookies cookies.txt\n```",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        line_count = raw.count("\n")
+        await safe_edit(msg,
+            f"```\n"
+            f"[COOKIES ACTIVATED]\n"
+            f"file    : {COOKIES_FILE.name}\n"
+            f"size    : {fmt_size(COOKIES_FILE.stat().st_size)}\n"
+            f"lines   : ~{line_count}\n"
+            f"status  : ACTIVE\n"
+            f"```\n\n"
+            f"✅ Cookie bypass is now active\\. Try your download again\\.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        logger.info("cookies.txt updated by user %d (%d bytes)", uid, COOKIES_FILE.stat().st_size)
+    except Exception as e:
+        await safe_edit(msg,
+            f"```\n[UPLOAD FAILED]\n{str(e)[:150].replace('`',chr(39))}\n```",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /auth — Trigger the Google OAuth2 device-auth flow entirely inside Telegram.
+
+    HOW IT WORKS (zero setup for users):
+      1. Admin runs /auth once
+      2. Bot starts Google device-auth via yt-dlp in a background thread
+      3. Google sends a URL + short code — bot DMs it to the admin
+      4. Admin opens the URL on their phone and enters the code (30 seconds)
+      5. yt-dlp receives the token and caches it as a refresh_token
+      6. ALL downloads now work from any IP — no cookies, no proxy needed
+      7. Token auto-renews forever unless the Google account revokes it
+
+    This is the ONLY truly free, zero-maintenance solution for server IPs.
+    """
+    uid = update.effective_user.id
+
+    # Only admins can trigger auth (protect the Google account)
+    if ADMIN_IDS and uid not in ADMIN_IDS:
+        await update.message.reply_text(
+            "```\n[RESTRICTED]\nOnly admins can run /auth.\n```",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    # Already authenticated
+    if oauth2_token_exists():
+        await update.message.reply_text(
+            "```\n"
+            "[OAUTH2 STATUS: ACTIVE]\n"
+            "Google account is already linked.\n"
+            "All downloads use authenticated bypass.\n"
+            "\n"
+            "To re-authenticate, delete the token:\n"
+            "  rm ~/.cache/yt-dlp/youtube-oauth2.token.json\n"
+            "Then run /auth again.\n"
+            "```",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    # Already in progress
+    if uid in _oauth_pending:
+        await update.message.reply_text(
+            "```\n[AUTH IN PROGRESS]\nAlready waiting for approval.\nCheck previous message.\n```",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    status_msg = await update.message.reply_text(
+        "```\n"
+        "[INITIATING GOOGLE OAUTH2]\n"
+        "Contacting Google servers...\n"
+        "This takes 5-15 seconds.\n"
+        "```",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    loop = asyncio.get_event_loop()
+
+    # Callback fired from the background thread
+    def on_device_url(url: str | None, code: str | None):
+        if url is None and code is None:
+            # Flow completed (success or timeout)
+            _oauth_pending.pop(uid, None)
+            if oauth2_token_exists():
+                asyncio.run_coroutine_threadsafe(
+                    safe_edit(
+                        status_msg,
+                        "```\n"
+                        "[OAUTH2 AUTHENTICATED]\n"
+                        "Google account linked!\n"
+                        "Token cached — lasts forever.\n"
+                        "\n"
+                        "All YouTube downloads now bypass\n"
+                        "IP blocks automatically.\n"
+                        "No further action needed.\n"
+                        "```",
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                    ),
+                    loop,
+                )
+            else:
+                asyncio.run_coroutine_threadsafe(
+                    safe_edit(
+                        status_msg,
+                        "```\n"
+                        "[AUTH TIMEOUT / FAILED]\n"
+                        "No approval received in 5 minutes.\n"
+                        "Run /auth again to retry.\n"
+                        "```",
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                    ),
+                    loop,
+                )
+            return
+
+        # Device URL received — send to admin
+        _oauth_pending[uid] = {"url": url, "code": code}
+        asyncio.run_coroutine_threadsafe(
+            safe_edit(
+                status_msg,
+                f"```\n"
+                f"[GOOGLE AUTH REQUIRED]\n"
+                f"{'─'*36}\n"
+                f"Step 1: Open this URL on your phone:\n"
+                f"```\n"
+                f"{url}\n\n"
+                f"```\n"
+                f"Step 2: Enter this code:\n"
+                f"```\n"
+                f"  {code}\n"
+                f"```\n"
+                f"Step 3: Sign in with any Google account\n\n"
+                f"_The bot will confirm automatically once approved\\._\n"
+                f"_Waiting up to 5 minutes\\.\\.\\._",
+                parse_mode=ParseMode.MARKDOWN,
+            ),
+            loop,
+        )
+
+    # Launch in background thread so bot stays responsive
+    _oauth_pending[uid] = True
+    t = threading.Thread(
+        target=_run_oauth2_flow,
+        args=(on_device_url,),
+        daemon=True,
+        name="oauth2-flow",
+    )
+    t.start()
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t0  = time.monotonic()
@@ -527,40 +976,42 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    po, _  = get_po_token()
-    mode   = "WEBHOOK" if WEBHOOK_URL else "POLLING"
-    ck     = "LOADED ✅" if COOKIES_FILE.exists() else "ABSENT ⚠"
-    pk     = "ACTIVE ✅" if po else "OFFLINE ✗"
-    proxy  = "ACTIVE ✅" if HTTP_PROXY else "DIRECT"
+    bs    = bypass_status()
+    mode  = "WEBHOOK" if WEBHOOK_URL else "POLLING"
+    def st(ok): return "OK  ✅" if ok else "----  ✗"
+    proxy_str = f"OK ({bs['proxy_count']}x) ✅" if bs["proxy"] else "----  ✗"
     await update.message.reply_text(
         f"```\n"
         f"╔═══════════════════════════════════╗\n"
         f"║  NEXUS-DL  //  OPERATOR MANUAL   ║\n"
         f"╠═══════════════════════════════════╣\n"
-        f"║  SYSTEM STATUS                   ║\n"
-        f"║  mode    : {mode:<22}║\n"
-        f"║  po_token: {pk:<22}║\n"
-        f"║  cookies : {ck:<22}║\n"
-        f"║  proxy   : {proxy:<22}║\n"
+        f"║  BYPASS STATUS                   ║\n"
+        f"║  cookies.txt : {st(bs['cookies']):<20}║\n"
+        f"║  oauth2      : {st(bs['oauth2']):<20}║\n"
+        f"║  po_token    : {st(bs['po_token']):<20}║\n"
+        f"║  proxy       : {proxy_str:<20}║\n"
         f"╠═══════════════════════════════════╣\n"
         f"║  LIMITS                          ║\n"
         f"║  max_file : {fmt_size(MAX_FILE_SIZE):<22}║\n"
         f"║  queue    : {MAX_QUEUE_SIZE:<22}║\n"
         f"║  rate     : {RATE_LIMIT_SEC}s cooldown{'':<13}║\n"
         f"╠═══════════════════════════════════╣\n"
-        f"║  FORMATS                         ║\n"
-        f"║  video: 144/240/360/480/720/      ║\n"
-        f"║         1080/1440/2160(4K)        ║\n"
-        f"║  audio: MP3(128/192/320k)         ║\n"
-        f"║         M4A best, OGG best        ║\n"
+        f"║  VIDEO FORMATS                   ║\n"
+        f"║  144p / 240p / 360p / 480p        ║\n"
+        f"║  720p / 1080p / 1440p / 2160p     ║\n"
+        f"║  Best Video+Audio (auto)          ║\n"
+        f"║  AUDIO FORMATS                   ║\n"
+        f"║  MP3 128k / 192k / 320k           ║\n"
+        f"║  M4A best  /  OGG best            ║\n"
         f"╠═══════════════════════════════════╣\n"
-        f"║  BOT-BYPASS CHAIN                ║\n"
-        f"║  tv_embedded → ios → android     ║\n"
-        f"║  → mweb → android_vr             ║\n"
+        f"║  FIX IP BLOCK                    ║\n"
+        f"║  send cookies.txt to this chat   ║\n"
+        f"║  or use /setcookies command       ║\n"
         f"╚═══════════════════════════════════╝\n"
-        f"```\n"
-        f"*Cookie fix:*\n"
-        f"`yt-dlp --cookies-from-browser chrome --cookies cookies.txt`",
+        f"```\n\n"
+        f"*Export cookies on your PC:*\n"
+        f"`yt-dlp --cookies-from-browser chrome --cookies cookies.txt`\n"
+        f"Then send the file to this chat — it will be saved automatically\\.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -684,8 +1135,9 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    safe_q = query[:40].replace("`", "'").replace("\\", "/")
     msg = await update.message.reply_text(
-        f"```\n[SEARCHING YT]\nquery: {mdescape(query[:40])}\n```",
+        f"```\n[SEARCHING YT]\nquery: {safe_q}\n```",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
@@ -717,7 +1169,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dur   = fmt_dur(e.get("duration") or 0)
         lines.append(f"[{i}] {title}")
         lines.append(f"     ⏱ {dur}")
-        url   = e.get("url") or f"https://youtube.com/watch?v={e.get('id','')}"
+        url      = normalize_url(e)
         safe_url = url.replace("|", "%7C")
         buttons.append([InlineKeyboardButton(
             f"[{i}] {title[:30]}",
@@ -730,36 +1182,60 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup(buttons))
 
 async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    YouTube's /feed/trending wall requires authentication from server IPs and
+    is blocked by most yt-dlp clients. Use targeted ytsearch queries instead —
+    these work on any IP without cookies.
+    Optional arg: category keyword e.g. /trending music
+    """
+    category = " ".join(context.args).strip() if context.args else ""
+    tag      = category or "today"
+    safe_tag = tag[:20].replace("`", "'")
+
     msg = await update.message.reply_text(
-        "```\n[PULLING TRENDING FEED...]\n```", parse_mode=ParseMode.MARKDOWN_V2
+        f"```\n[SCANNING TRENDING: {safe_tag.upper()}]\n```",
+        parse_mode=ParseMode.MARKDOWN_V2,
     )
+
+    search_q = f"ytsearch10:trending {category} 2025".strip()
 
     def _trend():
         opts = {**build_ydl_common(), "skip_download": True,
-                "extract_flat": True, "playlistend": 10}
+                "extract_flat": True, "quiet": True}
         with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info("https://www.youtube.com/feed/trending", download=False)
+            r = ydl.extract_info(search_q, download=False)
+            return r.get("entries") or []
 
     try:
-        results = await asyncio.wait_for(
+        entries = await asyncio.wait_for(
             asyncio.get_event_loop().run_in_executor(None, _trend),
-            timeout=30,
+            timeout=40,
         )
     except Exception as e:
-        await safe_edit(msg, f"```\n[FEED UNAVAILABLE]\n{mdescape(str(e)[:150])}\n```",
-                        parse_mode=ParseMode.MARKDOWN_V2)
+        err = str(e)[:120].replace("`", "'")
+        await safe_edit(msg,
+            f"```\n[TRENDING FAILED]\n{err}\n```",
+            parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    entries = (results.get("entries") or [])[:10]
-    lines   = ["```", "[TRENDING  //  YOUTUBE]", "─" * 36]
+    entries = [e for e in entries if e and e.get("id")][:10]
+    if not entries:
+        await safe_edit(msg,
+            "```\n[NO RESULTS]\nTry: /trending music\n     /trending gaming\n     /trending news\n```",
+            parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    lines   = ["```", f"[TRENDING: {safe_tag.upper()}]", "─" * 34]
     buttons = []
     for i, e in enumerate(entries, 1):
-        title = sanitize(e.get("title","?"))[:38]
-        lines.append(f"[{i}] {title}")
-        url      = e.get("url") or f"https://youtube.com/watch?v={e.get('id','')}"
+        title    = sanitize(e.get("title") or "Unknown")[:34]
+        dur      = fmt_dur(e.get("duration") or 0)
+        url      = normalize_url(e)
         safe_url = url.replace("|", "%7C")
+        lines.append(f"[{i:02d}] {title}")
+        lines.append(f"      {dur}")
         buttons.append([InlineKeyboardButton(
-            f"#{i} {title[:30]}",
+            f"#{i} {title[:32]}",
             callback_data=f"fetch|{safe_url}"
         )])
     lines.append("```")
@@ -806,7 +1282,7 @@ async def cmd_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dur      = fmt_dur(e.get("duration") or 0)
         lines.append(f"[{i}] {title[:36]}")
         lines.append(f"     ⏱ {dur}")
-        vid_url  = e.get("url") or f"https://youtube.com/watch?v={e.get('id','')}"
+        vid_url  = normalize_url(e)
         safe_url = vid_url.replace("|", "%7C")
         buttons.append([InlineKeyboardButton(
             f"[{i}] {title[:30]}",
@@ -1292,26 +1768,38 @@ async def post_init(app):
         asyncio.create_task(worker(i + 1))
     # Register bot commands for the menu button
     await app.bot.set_my_commands([
-        BotCommand("start",    "Boot sequence"),
-        BotCommand("search",   "Search YouTube"),
-        BotCommand("trending", "YouTube trending"),
-        BotCommand("playlist", "Extract playlist"),
-        BotCommand("info",     "Inspect a URL"),
-        BotCommand("history",  "Your download log"),
-        BotCommand("queue",    "Mission queue status"),
-        BotCommand("stats",    "System telemetry"),
-        BotCommand("ping",     "Latency check"),
-        BotCommand("help",     "Operator manual"),
+        BotCommand("start",      "Boot sequence"),
+        BotCommand("auth",       "Link Google account (fixes IP block)"),
+        BotCommand("search",     "Search YouTube"),
+        BotCommand("trending",   "Trending videos [category]"),
+        BotCommand("playlist",   "Extract playlist"),
+        BotCommand("info",       "Inspect a URL"),
+        BotCommand("history",    "Your download log"),
+        BotCommand("setcookies", "Upload cookies.txt"),
+        BotCommand("queue",      "Mission queue status"),
+        BotCommand("stats",      "System telemetry"),
+        BotCommand("ping",       "Latency check"),
+        BotCommand("help",       "Operator manual"),
     ])
     po, _ = get_po_token()
+    oa    = oauth2_token_exists()
+    ck    = COOKIES_FILE.exists()
+    px    = len(_PROXY_LIST) > 0
     logger.info(
-        "NEXUS-DL online | workers=%d | mode=%s | po_token=%s | cookies=%s | proxy=%s",
+        "NEXUS-DL online | workers=%d | mode=%s | oauth2=%s | cookies=%s | po_token=%s | proxy=%s",
         WORKERS,
         "webhook" if WEBHOOK_URL else "polling",
+        "yes" if oa else "no",
+        "yes" if ck else "no",
         "yes" if po else "no",
-        "yes" if COOKIES_FILE.exists() else "no",
-        "yes" if HTTP_PROXY else "no",
+        f"{len(_PROXY_LIST)}x" if px else "no",
     )
+    if not oa and not ck and not px:
+        logger.warning(
+            "⚠ NO BYPASS ACTIVE — YouTube will block downloads from this IP.\n"
+            "  Fix: send /auth in Telegram and approve the Google login.\n"
+            "  This is a one-time setup. Token lasts forever."
+        )
 
 def main():
     app = (
@@ -1329,17 +1817,21 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("help",     cmd_help))
-    app.add_handler(CommandHandler("stats",    cmd_stats))
-    app.add_handler(CommandHandler("queue",    cmd_queue))
-    app.add_handler(CommandHandler("ping",     cmd_ping))
-    app.add_handler(CommandHandler("history",  cmd_history))
-    app.add_handler(CommandHandler("info",     cmd_info))
-    app.add_handler(CommandHandler("search",   cmd_search))
-    app.add_handler(CommandHandler("trending", cmd_trending))
-    app.add_handler(CommandHandler("playlist", cmd_playlist))
+    app.add_handler(CommandHandler("start",      cmd_start))
+    app.add_handler(CommandHandler("auth",       cmd_auth))
+    app.add_handler(CommandHandler("help",       cmd_help))
+    app.add_handler(CommandHandler("stats",      cmd_stats))
+    app.add_handler(CommandHandler("queue",      cmd_queue))
+    app.add_handler(CommandHandler("ping",       cmd_ping))
+    app.add_handler(CommandHandler("history",    cmd_history))
+    app.add_handler(CommandHandler("info",       cmd_info))
+    app.add_handler(CommandHandler("search",     cmd_search))
+    app.add_handler(CommandHandler("trending",   cmd_trending))
+    app.add_handler(CommandHandler("playlist",   cmd_playlist))
+    app.add_handler(CommandHandler("setcookies", cmd_setcookies))
     app.add_handler(CallbackQueryHandler(button_handler))
+    # Document handler — catches cookies.txt uploads (must be before TEXT handler)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_error_handler(error_handler)
 
