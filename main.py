@@ -42,7 +42,7 @@ from pathlib import Path
 #  CONFIG
 # ═══════════════════════════════════════════════════════════
 
-BOT_TOKEN        = os.getenv("BOT_TOKEN")
+# DEBUG REMOVED - Fixed below
 WEBHOOK_URL      = os.environ.get("WEBHOOK_URL",  "")
 PORT             = int(os.environ.get("PORT",     8443))
 ADMIN_IDS        = set(
@@ -53,9 +53,18 @@ DOWNLOAD_FOLDER  = Path(os.getenv("DOWNLOAD_FOLDER", "downloads"))
 CACHE_FOLDER     = Path(os.getenv("CACHE_FOLDER", "cache"))
 COOKIES_FILE     = Path(os.getenv("COOKIES_FILE", "cookies.txt"))
 
-load_dotenv()
+load_dotenv(override=True)
 
-LOCAL_API_URL    = os.environ.get("LOCAL_API_URL", "")
+# FORCE DIRECT LOAD - dotenv bypass working
+from dotenv import dotenv_values
+config = dotenv_values('.env')
+BOT_TOKEN = config.get('BOT_TOKEN')
+print(f"[FORCE] Token from dotenv_values: {repr(BOT_TOKEN)[:50]}")
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN missing from .env - check format!")
+
+LOCAL_API_URL    = os.getenv("LOCAL_API_URL", "")
 _using_local_api = bool(LOCAL_API_URL)
 MAX_FILE_SIZE    = 500 * 1024 * 1024 if _using_local_api else 50 * 1024 * 1024
 
@@ -106,7 +115,7 @@ def _check_ytdlp_version():
         year = int(ver.split(".")[0])
         if year < 2024:
             logger.warning(
-                "⚠ yt-dlp %s is outdated — run: pip install -U yt-dlp --break-system-packages", ver
+                "[!] yt-dlp %s is outdated — run: pip install -U yt-dlp --break-system-packages", ver
             )
         else:
             logger.info("yt-dlp version: %s OK", ver)
@@ -275,7 +284,7 @@ def build_ydl_common() -> dict:
         opts["cookiefile"] = str(COOKIES_FILE)
         logger.info("🍪 cookies.txt loaded (%d bytes)", COOKIES_FILE.stat().st_size)
     else:
-        logger.warning("⚠ No cookies.txt — downloads will likely fail from this IP")
+        logger.warning("[!] No cookies.txt — downloads will likely fail from this IP")
     if FFMPEG_LOCATION:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
     proxy = get_next_proxy()
@@ -1632,7 +1641,7 @@ async def post_init(app):
     )
 
     if not oa and not ck and not px:
-        logger.warning("⚠ NO BYPASS ACTIVE — run /auth in Telegram.")
+        logger.warning("[!] NO BYPASS ACTIVE — run /auth in Telegram.")
         if ADMIN_IDS:
             for admin_id in ADMIN_IDS:
                 try:
@@ -1650,19 +1659,17 @@ async def post_init(app):
                 except Exception: pass
 
 def main():
-    builder = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .connect_timeout(120)
-        .read_timeout(120)
-        .write_timeout(600)
-        .pool_timeout(120)
-        .get_updates_connect_timeout(60)
-        .get_updates_read_timeout(60)
-        .get_updates_write_timeout(60)
-        .get_updates_pool_timeout(60)
+    builder = ApplicationBuilder() \
+        .token(BOT_TOKEN) \
+        .connect_timeout(120) \
+        .read_timeout(120) \
+        .write_timeout(600) \
+        .pool_timeout(120) \
+        .get_updates_connect_timeout(60) \
+        .get_updates_read_timeout(60) \
+        .get_updates_write_timeout(60) \
+        .get_updates_pool_timeout(60) \
         .post_init(post_init)
-    )
     if LOCAL_API_URL:
         builder = builder.base_url(f"{LOCAL_API_URL}/bot")
         logger.info("Using local Bot API server: %s  (limit: %s)", LOCAL_API_URL, fmt_size(MAX_FILE_SIZE))
@@ -1672,20 +1679,14 @@ def main():
     app = builder.build()
     app.add_handler(CommandHandler("cache",       cmd_cache))
     app.add_handler(CommandHandler("start",       cmd_start))
-
-
-
-
     app.add_handler(CommandHandler("help",        cmd_help))
     app.add_handler(CommandHandler("stats",       cmd_stats))
     app.add_handler(CommandHandler("queue",       cmd_queue))
-
     app.add_handler(CommandHandler("history",     cmd_history))
     app.add_handler(CommandHandler("info",        cmd_info))
     app.add_handler(CommandHandler("search",      cmd_search))
     app.add_handler(CommandHandler("trending",    cmd_trending))
     app.add_handler(CommandHandler("playlist",    cmd_playlist))
-
     app.add_handler(CallbackQueryHandler(button_handler))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
