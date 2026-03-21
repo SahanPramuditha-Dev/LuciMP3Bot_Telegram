@@ -1,7 +1,11 @@
-"""
+r"""
 ╔═══════════════════════════════════════════════════════════╗
-║          N E X U S - D L   //  MEDIA EXTRACTION BOT      ║
-║          v3.1  |  FIXED: cookie validation + debug       ║
+║         ▓ L U C I C R Y P T ▓ // MEDIA DECRYPTOR v4.0     ║
+║         [CRYPTO-STEALTH BYPASS] // AGE-RESTRICTED OK      ║
+╚═══════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════╗
+║          N E X U S - D L   //  MEDIA EXTRACTION BOT       ║
+║          v3.1  |  FIXED: cookie validation + debug        ║
 ╚═══════════════════════════════════════════════════════════╝
 
   FIXES IN v3.1:
@@ -21,28 +25,35 @@ from pathlib import Path
 from collections import OrderedDict, defaultdict
 
 import yt_dlp
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
     CallbackQueryHandler, ContextTypes, filters,
 )
+
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter
+import difflib
+import json
+from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════════
 
-BOT_TOKEN        = os.environ.get("BOT_TOKEN",    "YOUR_TOKEN")
+BOT_TOKEN        = os.getenv("BOT_TOKEN")
 WEBHOOK_URL      = os.environ.get("WEBHOOK_URL",  "")
 PORT             = int(os.environ.get("PORT",     8443))
 ADMIN_IDS        = set(
-    int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 )
 
-DOWNLOAD_FOLDER  = Path("downloads")
-CACHE_FOLDER     = Path("cache")
-COOKIES_FILE     = Path("cookies.txt")
+DOWNLOAD_FOLDER  = Path(os.getenv("DOWNLOAD_FOLDER", "downloads"))
+CACHE_FOLDER     = Path(os.getenv("CACHE_FOLDER", "cache"))
+COOKIES_FILE     = Path(os.getenv("COOKIES_FILE", "cookies.txt"))
+
+load_dotenv()
 
 LOCAL_API_URL    = os.environ.get("LOCAL_API_URL", "")
 _using_local_api = bool(LOCAL_API_URL)
@@ -98,7 +109,7 @@ def _check_ytdlp_version():
                 "⚠ yt-dlp %s is outdated — run: pip install -U yt-dlp --break-system-packages", ver
             )
         else:
-            logger.info("yt-dlp version: %s ✓", ver)
+            logger.info("yt-dlp version: %s OK", ver)
     except Exception as e:
         logger.warning("Could not check yt-dlp version: %s", e)
 
@@ -336,7 +347,7 @@ download_queue:    asyncio.Queue           = None
 active_downloads:  dict[int, str]          = {}
 user_last_request: OrderedDict             = OrderedDict()
 user_history:      dict[int, list]         = defaultdict(list)
-user_queue_item:   dict[int, asyncio.Task] = {}
+
 
 stats = {
     "users":      set(),
@@ -345,6 +356,10 @@ stats = {
     "bytes_sent": 0,
     "start_time": time.time(),
 }
+
+# Cache index for song name lookup
+INDEX_PATH = CACHE_FOLDER / "index.json"
+cache_index: dict[str, list] = {}
 
 # ═══════════════════════════════════════════════════════════
 #  HACKER ANIMATIONS
@@ -367,11 +382,9 @@ _FETCH_LINES = [
 ]
 _DL_PHASES = ["INTERCEPTING STREAM", "PULLING FRAGMENTS", "STITCHING SEGMENTS", "MUXING CONTAINER", "VERIFYING PAYLOAD"]
 
-def _hbar(pct: float, width: int = 16) -> str:
+def _emoji_bar(pct: float, width: int = 10) -> str:
     filled = int(pct / 100 * width)
-    head   = 1 if filled < width else 0
-    empty  = width - filled - head
-    return _BAR_FULL * filled + (_BAR_HEAD if head else "") + _BAR_EMPTY * max(empty, 0)
+    return "🟩" * filled + "🟨" * (width - filled - 1) + "🟥"
 
 def _phase(pct: float) -> str:
     return _DL_PHASES[min(int(pct / 100 * len(_DL_PHASES)), len(_DL_PHASES) - 1)]
@@ -387,6 +400,52 @@ def _glitch(text: str, frame: int) -> str:
 # ═══════════════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════════════
+
+def load_cache_index():
+    global cache_index
+    if INDEX_PATH.exists():
+        try:
+            cache_index = json.loads(INDEX_PATH.read_text())
+            if not isinstance(cache_index, dict):
+                cache_index = {}
+        except:
+            cache_index = {}
+    else:
+        cache_index = {}
+
+def save_cache_index():
+    try:
+        INDEX_PATH.parent.mkdir(exist_ok=True)
+        INDEX_PATH.write_text(json.dumps(cache_index, indent=2, ensure_ascii=False))
+    except Exception as e:
+        logger.warning("Failed to save cache index: %s", e)
+
+def search_cache_songs(query: str, max_results: int = 10) -> list:
+    query_lower = query.lower().strip()
+    if not query_lower:
+        return []
+
+    # Exact/contains matches first
+    direct_matches = []
+    for title, entries in cache_index.items():
+        if query_lower in title.lower():
+            direct_matches.extend([{"title": title, **e} for e in entries])
+
+    # Fuzzy matches if few direct
+    fuzzy_matches = []
+    if len(direct_matches) < 5:
+        scores = []
+        for title in cache_index:
+            score = difflib.SequenceMatcher(None, query_lower, title.lower()).ratio()
+            if score > 0.5:
+                scores.append((score, title))
+        scores.sort(reverse=True, key=lambda x: x[0])
+        for score, title in scores[:max_results]:
+            entries = cache_index[title]
+            fuzzy_matches.extend([{"title": title, "score": score, **e} for e in entries])
+
+    combined = direct_matches + fuzzy_matches
+    return list({e["path"]: e for e in combined}.values())[:max_results]  # Dedup by path
 
 def fmt_size(n: float) -> str:
     for u in ["B", "KB", "MB", "GB"]:
@@ -570,6 +629,44 @@ def build_buttons(info: dict, url: str) -> list:
 #  COMMANDS
 # ═══════════════════════════════════════════════════════════
 
+async def cmd_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    load_cache_index()
+    args = " ".join(context.args).strip()
+    if not args:
+        await update.message.reply_text(
+            "```\n[CACHE SEARCH]\nUsage: /cache <song name or keywords>\n\n"
+            "Finds cached MP3s by title. Fuzzy matching enabled.\n```",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+
+    matches = search_cache_songs(args)
+    if not matches:
+        await update.message.reply_text(
+            f"```\n[NO MATCHES]\n'{args}' not found in cache.\n\n"
+            f"Cache has {len(cache_index)} songs.\nTry broader keywords.\n```",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+
+    lines = ["```", f"[CACHE SEARCH: {args}]", f"Found {len(matches)} matches:", "─" * 36]
+    buttons = []
+    for i, match in enumerate(matches, 1):
+        title = match["title"][:35]
+        qual = match["quality"]
+        lines.append(f"[{i}] 🎵 {title} ({qual})")
+        lines.append(f"     📁 {Path(match['path']).name}")
+        cb_data = f"cache_send|{match['path']}"
+        buttons.append([InlineKeyboardButton(f"[{i}] {title[:28]} {qual}", callback_data=cb_data)])
+    lines.append("```")
+    buttons.append([InlineKeyboardButton("✖ Close", callback_data="cancel")])
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats["users"].add(update.effective_user.id)
     name = update.effective_user.first_name or "AGENT"
@@ -598,10 +695,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── /cookietest — live validation ─────────────────────────
 
-async def cmd_cookietest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if ADMIN_IDS and uid not in ADMIN_IDS:
-        return
+
 
     if not COOKIES_FILE.exists():
         await update.message.reply_text(
@@ -644,10 +738,7 @@ async def cmd_cookietest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── /authstatus — token file details ──────────────────────
 
-async def cmd_authstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if ADMIN_IDS and uid not in ADMIN_IDS:
-        return
+
 
     cache_dir  = _yt_dlp_cache_dir()
     token_path = cache_dir / "youtube-oauth2.token.json"
@@ -690,9 +781,7 @@ async def cmd_setcookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── handle_document — cookie upload ───────────────────────
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc  = update.message.document
-    uid  = update.effective_user.id
+
 
     if ADMIN_IDS and uid not in ADMIN_IDS:
         await update.message.reply_text(
@@ -754,14 +843,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── /auth ──────────────────────────────────────────────────
 
-async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    chat = update.effective_chat.id
-    bot  = context.bot
 
-    if ADMIN_IDS and uid not in ADMIN_IDS:
-        await update.message.reply_text("Only admins can run /auth.")
-        return
 
     if oauth2_token_exists():
         await update.message.reply_text(
@@ -912,7 +994,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"╠═══════════════════════════════════╣\n║  DIAGNOSTICS                     ║\n"
         f"║  /cookietest — test cookies live  ║\n"
         f"║  /authstatus — token file paths   ║\n"
-        f"║  /authtest   — test Google API    ║\n"
+
         f"╚═══════════════════════════════════╝\n```",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
@@ -1151,6 +1233,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    if query.data.startswith("cache_send|"):
+        path = query.data[11:]
+        cp = Path(path)
+        if not cp.exists():
+            await query.answer("❌ File no longer in cache.", show_alert=True)
+            return
+
+        load_cache_index()
+        # Find entry for title
+        title = "Unknown Title"
+        for t, entries in cache_index.items():
+            for e in entries:
+                if e["path"] == path:
+                    title = t
+                    break
+            if title != "Unknown Title":
+                break
+
+        try:
+            cap = f"🎵 `{Path(path).stem}` \\(from cache\\)"
+            with open(cp, "rb") as f:
+                await query.message.reply_audio(
+                    f, caption=cap, title=title[:100], parse_mode=ParseMode.MARKDOWN_V2,
+                    read_timeout=120, write_timeout=120
+                )
+            stats["downloads"] += 1
+        except Exception as e:
+            logger.error("cache send fail: %s", e)
+        try:
+            await query.message.delete()
+        except:
+            pass
+        return
+
     if query.data == "cancel":
         try: await query.message.delete()
         except Exception: pass
@@ -1371,8 +1487,26 @@ async def process(query, typ: str, quality: str, url: str, msg, wid: int):
         parse_mode=ParseMode.MARKDOWN_V2)
 
     if not need_split:
-        try: shutil.copy2(fp, cp)
-        except Exception as ce: logger.warning("cache write: %s", ce)
+        try: 
+            shutil.copy2(fp, cp)
+            # Update cache index with song name
+            info = await loop.run_in_executor(None, get_video_info, url)
+            song_title = sanitize(info.get("title", "Unknown"))[:200]
+            entry = {
+                "path": str(cp),
+                "typ": typ,
+                "quality": quality,
+                "url": url
+            }
+            load_cache_index()
+            if song_title not in cache_index:
+                cache_index[song_title] = []
+            if entry not in cache_index[song_title]:  # Avoid dups
+                cache_index[song_title].append(entry)
+            save_cache_index()
+            logger.info("Cached %s -> index updated (%d entries for '%s')", cp.name, len(cache_index.get(song_title, [])), song_title[:50])
+        except Exception as ce: 
+            logger.warning("cache write: %s", ce)
 
     try:
         if need_split and typ in ("mp3", "m4a", "ogg"):
@@ -1472,18 +1606,18 @@ async def post_init(app):
 
     await app.bot.set_my_commands([
         BotCommand("start",       "Boot sequence"),
-        BotCommand("auth",        "Link Google account (fixes IP block)"),
-        BotCommand("cookietest",  "Test cookies.txt live against YouTube"),
-        BotCommand("authstatus",  "Show OAuth2 token file paths"),
+
+
+
         BotCommand("search",      "Search YouTube"),
         BotCommand("trending",    "Trending videos [category]"),
         BotCommand("playlist",    "Extract playlist"),
         BotCommand("info",        "Inspect a URL"),
         BotCommand("history",     "Your download log"),
-        BotCommand("setcookies",  "How to upload cookies.txt"),
+
         BotCommand("queue",       "Mission queue status"),
         BotCommand("stats",       "System telemetry"),
-        BotCommand("ping",        "Latency check"),
+
         BotCommand("help",        "Operator manual"),
     ])
 
@@ -1536,25 +1670,30 @@ def main():
         logger.info("Using cloud Bot API  (limit: %s)", fmt_size(MAX_FILE_SIZE))
 
     app = builder.build()
+    app.add_handler(CommandHandler("cache",       cmd_cache))
     app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("auth",        cmd_auth))
-    app.add_handler(CommandHandler("authtest",    cmd_authtest))
-    app.add_handler(CommandHandler("authstatus",  cmd_authstatus))
-    app.add_handler(CommandHandler("cookietest",  cmd_cookietest))
+
+
+
+
     app.add_handler(CommandHandler("help",        cmd_help))
     app.add_handler(CommandHandler("stats",       cmd_stats))
     app.add_handler(CommandHandler("queue",       cmd_queue))
-    app.add_handler(CommandHandler("ping",        cmd_ping))
+
     app.add_handler(CommandHandler("history",     cmd_history))
     app.add_handler(CommandHandler("info",        cmd_info))
     app.add_handler(CommandHandler("search",      cmd_search))
     app.add_handler(CommandHandler("trending",    cmd_trending))
     app.add_handler(CommandHandler("playlist",    cmd_playlist))
-    app.add_handler(CommandHandler("setcookies",  cmd_setcookies))
+
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_error_handler(error_handler)
+
+    # Load cache index on startup
+    load_cache_index()
+    logger.info("Cache index loaded: %d songs", len(cache_index))
 
     if WEBHOOK_URL:
         logger.info("WEBHOOK mode — port %d", PORT)
