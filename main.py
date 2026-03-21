@@ -406,6 +406,10 @@ def _glitch(text: str, frame: int) -> str:
         return text[:pos] + c + text[pos + 1:]
     return text
 
+def _hbar(pct: float, width: int = 20) -> str:
+    """Progress bar used in download hook"""
+    return _emoji_bar(pct, width)
+
 # ═══════════════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════════════

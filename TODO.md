@@ -1,16 +1,15 @@
-# NEXUS-DL Bot Fix - TODO ✓
+# NEXUS-DL Cleanup - Code Optimization ✓
 
-## Status: Logging Unicode errors FIXED (⚠ → [!] in all locations)
+## Plan Progress:
+- [x] Original logging fix
+- [x] Plan confirmed
+- [ ] Step 1: Update TODO.md
+- [ ] Step 2: Fix _hbar definition
+- [ ] Step 3: Complete cmd_help formatting
+- [ ] Step 4: Remove unused code (cmd_authtest, cmd_setcookies, handle_document stubs)
+- [ ] Step 5: Clean duplicate imports/comments
+- [ ] Step 6: Test run `python main.py`
+- [ ] Step 7: Verify /help command
 
-## Approved Plan Steps:
-- [x] Step 1: Fix logging Unicode error ✓
-- [ ] Step 2: Fix worker shutdown 
-- [x] Step 3: Applied logging edits to both files ✓
-- [ ] Step 4: Test clean shutdown
-- [ ] Step 5: Test logging
-- [ ] Step 6: Verify main.py
-- [ ] Step 7: Complete
-
-**Next: Fix worker() graceful shutdown.**
-
+**Next: main.py edits**
 
